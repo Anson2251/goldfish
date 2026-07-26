@@ -1,0 +1,29 @@
+name: alphabet
+version: "1.0"
+modality: text
+builder: text_files_lm
+task: causal_language_model
+format:
+  encoding: utf-8
+  document_unit: file
+  append_eos: true
+splits:
+  train:
+    files:
+      - train/01-alphabet.txt
+  val:
+    files:
+      - val/01-alphabet.txt
+  test:
+    files:
+      - test/01-alphabet.txt
+tokenizer:
+  name: character
+  artifact: tokenizer/tokenizer.json
+  lock: tokenizer/tokenizer-lock.json
+  fit_split: train
+  special_tokens:
+    pad: "<pad>"
+    eos: "<eos>"
+locking:
+  dataset_lock: dataset-lock.json
