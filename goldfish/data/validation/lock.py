@@ -8,7 +8,13 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .manifest import Manifest, ManifestValidationError, manifest_file_path, validator_registry
+from .manifest import (
+    Manifest,
+    ManifestValidationError,
+    manifest_file_pair_paths,
+    manifest_file_path,
+    validator_registry,
+)
 
 LOCK_FORMAT_V1 = "goldfish-dataset-lock-v1"
 TOKENIZER_LOCK_FORMAT_V1 = "goldfish-tokenizer-lock-v1"
@@ -55,6 +61,13 @@ def _split_fingerprint(split_name: str, files: list[dict[str, object]]) -> str:
     return sha256_bytes(canonical_json({"split": split_name, "files": files}))
 
 
+def _document_unit(manifest: Mapping[str, Any]) -> str:
+    format_declaration = manifest.get("format")
+    if not isinstance(format_declaration, Mapping) or not isinstance(format_declaration.get("document_unit"), str):
+        raise DatasetLockValidationError("Cannot build lock: manifest format.document_unit must be declared.")
+    return format_declaration["document_unit"]
+
+
 def _lock_manifest_semantics(manifest: Mapping[str, Any]) -> dict[str, object]:
     return {
         field: manifest[field]
@@ -70,6 +83,7 @@ def build_dataset_lock(root: Path | str, manifest: Manifest) -> dict[str, object
     if not isinstance(splits_value, Mapping):
         raise DatasetLockValidationError("Cannot build lock: manifest 'splits' must be a mapping.")
 
+    document_unit = _document_unit(manifest)
     locked_splits: dict[str, object] = {}
     for split_name, split_value in splits_value.items():
         if not isinstance(split_name, str) or not isinstance(split_value, Mapping):
@@ -77,10 +91,19 @@ def build_dataset_lock(root: Path | str, manifest: Manifest) -> dict[str, object
         files_value = split_value.get("files")
         if not isinstance(files_value, list):
             raise DatasetLockValidationError(f"Cannot build lock: splits.{split_name}.files must be a list.")
-        files = [
-            _file_snapshot(root, manifest_file_path(entry, f"splits.{split_name}.files[{index}]"))
-            for index, entry in enumerate(files_value)
-        ]
+        files: list[dict[str, object]] = []
+        for index, entry in enumerate(files_value):
+            field = f"splits.{split_name}.files[{index}]"
+            if document_unit == "file-pair":
+                input_path, output_path = manifest_file_pair_paths(entry, field)
+                files.append(
+                    {
+                        "input": _file_snapshot(root, input_path),
+                        "output": _file_snapshot(root, output_path),
+                    }
+                )
+            else:
+                files.append(_file_snapshot(root, manifest_file_path(entry, field)))
         locked_splits[split_name] = {"fingerprint": _split_fingerprint(split_name, files), "files": files}
 
     lock: dict[str, object] = {

@@ -23,6 +23,24 @@ class LanguageModelBatch:
         )
 
 
+@dataclass
+class PrefixLanguageModelBatch:
+    """Language-model batch with a mask selecting positions that contribute loss."""
+
+    input_ids: Tensor
+    target_ids: Tensor
+    attention_mask: Tensor
+    loss_mask: Tensor
+
+    def to(self, device: torch.device) -> Self:
+        return type(self)(
+            input_ids=self.input_ids.to(device),
+            target_ids=self.target_ids.to(device),
+            attention_mask=self.attention_mask.to(device),
+            loss_mask=self.loss_mask.to(device),
+        )
+
+
 def collate_language_model_batches(rows: list[LanguageModelBatch]) -> LanguageModelBatch:
     """Stack fixed-length dataset rows into a rank-two language-model batch."""
     if not rows:
@@ -31,4 +49,16 @@ def collate_language_model_batches(rows: list[LanguageModelBatch]) -> LanguageMo
         input_ids=torch.stack([row.input_ids for row in rows]),
         target_ids=torch.stack([row.target_ids for row in rows]),
         attention_mask=torch.stack([row.attention_mask for row in rows]),
+    )
+
+
+def collate_prefix_language_model_batches(rows: list[PrefixLanguageModelBatch]) -> PrefixLanguageModelBatch:
+    """Stack fixed-length paired prefix-language-model rows."""
+    if not rows:
+        raise ValueError("Cannot collate an empty batch.")
+    return PrefixLanguageModelBatch(
+        input_ids=torch.stack([row.input_ids for row in rows]),
+        target_ids=torch.stack([row.target_ids for row in rows]),
+        attention_mask=torch.stack([row.attention_mask for row in rows]),
+        loss_mask=torch.stack([row.loss_mask for row in rows]),
     )

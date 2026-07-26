@@ -16,6 +16,10 @@ dependencies = [
     "tqdm>=4.69.1",
 ]
 
+[project.scripts]
+goldfish = "goldfish.cli:main"
+gf = "goldfish.cli:main"
+
 [[tool.uv.index]]
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"

@@ -1,0 +1,42 @@
+name: repeat
+version: "1.0"
+modality: text
+builder: text_file_pairs
+task: prefix_language_model
+
+format:
+  encoding: utf-8
+  document_unit: file-pair
+
+splits:
+  train:
+    files:
+      - input: train/01-rangle-langle-input.txt
+        output: train/01-rangle-langle-output.txt
+      - input: train/02-equals-input.txt
+        output: train/02-equals-output.txt
+  val:
+    files:
+      - input: val/01-rangle-langle-input.txt
+        output: val/01-rangle-langle-output.txt
+      - input: val/02-equals-input.txt
+        output: val/02-equals-output.txt
+  test:
+    files:
+      - input: test/01-rangle-langle-input.txt
+        output: test/01-rangle-langle-output.txt
+      - input: test/02-equals-input.txt
+        output: test/02-equals-output.txt
+
+tokenizer:
+  name: character
+  artifact: tokenizer/tokenizer.json
+  lock: tokenizer/tokenizer-lock.json
+  fit_split: train
+  special_tokens:
+    pad: "<pad>"
+    eos: "<eos>"
+    sep: "<sep>"
+
+locking:
+  dataset_lock: dataset-lock.json

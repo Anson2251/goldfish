@@ -19,23 +19,31 @@ uv sync
 Prepare the included text dataset. This validates `manifest.yaml`, fits the tokenizer on the **train split only**, and writes the dataset and tokenizer locks:
 
 ```sh
-uv run python main.py prepare data/alphabet
+uv run goldfish prepare data/alphabet
+# Equivalent: uv run python prepare.py data/alphabet
 ```
 
 Then train a new GRU experiment:
 
 ```sh
-uv run python main.py train data/alphabet \
+uv run goldfish train data/alphabet \
   --name alphabet-gru \
   --sequence-length 13 \
   --batch-size 32 \
   --epochs 40 \
   --model gru \
+  --device cuda \
   --optimizer adamw \
   --weight-decay 0.0001 \
   --gradient-clip-norm 1.0 \
   --prompt "cdefg" \
   --max-new-tokens 100
+```
+
+The dispatcher forwards all arguments after `train` directly to `train.py`, so this is equivalent:
+
+```sh
+uv run python train.py data/alphabet --name alphabet-gru --epochs 40
 ```
 
 The run is created under `runs/`, for example:
@@ -79,7 +87,7 @@ data/<dataset-name>/
 ### Prepare before training
 
 ```sh
-uv run python main.py prepare data/alphabet
+uv run goldfish prepare data/alphabet
 ```
 
 Preparation performs:
@@ -99,7 +107,7 @@ Training validates both locks before constructing a DataLoader or optimizing. If
 The command form is:
 
 ```sh
-uv run python main.py train <dataset-root> [options]
+uv run goldfish train <dataset-root> [options]
 ```
 
 ### Models
@@ -119,6 +127,24 @@ Common model options:
 | `--hidden-dim` | `128` | Recurrent hidden-state dimension. |
 | `--num-layers` | `1` | Number of GRU/LSTM layers. |
 | `--dropout` | `0.0` | Recurrent inter-layer dropout. |
+
+### Device selection
+
+Both training and inference accept:
+
+```sh
+--device cpu
+--device cuda
+--device mps
+```
+
+When `--device` is omitted, Goldfish chooses the best available platform device in this order:
+
+```text
+CUDA → MPS → CPU
+```
+
+An explicit unavailable accelerator is an error: `--device cuda` does not silently fall back to CPU. The resolved device is recorded in the run configuration and environment metadata.
 
 ### Optimizers
 
@@ -159,7 +185,7 @@ The resolved run config records all effective optimizer defaults, including Adam
 Example cosine run:
 
 ```sh
-uv run python main.py train data/alphabet \
+uv run goldfish train data/alphabet \
   --name alphabet-cosine \
   --epochs 40 \
   --scheduler cosine \
@@ -206,7 +232,7 @@ Useful options:
 Resume from the run's `checkpoints/latest.pt`:
 
 ```sh
-uv run python main.py train data/alphabet \
+uv run goldfish train data/alphabet \
   --resume runs/exp1-alphabet-gru \
   --epochs 10
 ```
@@ -222,12 +248,33 @@ Resume is deliberately strict. It verifies:
 
 Model/data/optimizer/scheduler changes require a new run. Forking experiment runs is planned but not yet implemented.
 
-## CLI help and tests
+## Inference
+
+Generate from a managed experiment without creating a new run:
 
 ```sh
-uv run python main.py --help
-uv run python main.py prepare --help
-uv run python main.py train --help
+uv run goldfish infer runs/exp1-alphabet-gru \
+  --checkpoint best \
+  --prompt "cdefg" \
+  --max-new-tokens 100
+
+uv run python infer.py runs/exp1-alphabet-gru --checkpoint best --prompt "cdefg" --device cpu
+```
+
+`infer.py` loads the run's resolved model configuration and the selected managed checkpoint (`best`, `latest`, or `final`). It validates the current dataset and tokenizer locks before generation, so inference does not silently run with a changed vocabulary or dataset bundle.
+
+## Commands, help, and tests
+
+| Dispatcher command | Direct entry point | Purpose |
+|---|---|---|
+| `goldfish prepare ...` | `prepare.py ...` | Build tokenizer and lock artifacts for a dataset. |
+| `goldfish train ...` | `train.py ...` | Create or resume a managed training run. |
+| `goldfish infer ...` | `infer.py ...` | Generate text from a managed checkpoint. |
+
+```sh
+uv run goldfish --help
+uv run python train.py --help
+uv run python infer.py --help
 
 uv run pytest -q
 ```

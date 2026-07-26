@@ -48,6 +48,15 @@ def manifest_file_path(entry: object, field: str) -> str:
     return path
 
 
+def manifest_file_pair_paths(entry: object, field: str) -> tuple[str, str]:
+    """Return validated input/output paths from a file-pair manifest entry."""
+    pair = _require_mapping(entry, field)
+    return (
+        manifest_file_path(pair.get("input"), f"{field}.input"),
+        manifest_file_path(pair.get("output"), f"{field}.output"),
+    )
+
+
 class ManifestValidatorV1:
     """Validator for manifest version ``1.0``."""
 
@@ -59,21 +68,34 @@ class ManifestValidatorV1:
         for field in self._required_fields:
             _require_nonempty_string(manifest.get(field), field)
 
+        format_declaration = _require_mapping(manifest.get("format"), "format")
+        encoding = _require_nonempty_string(format_declaration.get("encoding"), "format.encoding")
+        if encoding != "utf-8":
+            raise ManifestValidationError("manifest format.encoding must be 'utf-8'.")
+        document_unit = _require_nonempty_string(format_declaration.get("document_unit"), "format.document_unit")
+        if document_unit not in {"file", "file-pair"}:
+            raise ManifestValidationError("manifest format.document_unit must be 'file' or 'file-pair'.")
+
         splits = _require_mapping(manifest.get("splits"), "splits")
-        for split_name in ("train", "val"):
+        split_names = ("train", "val", "test") if document_unit == "file-pair" else ("train", "val")
+        for split_name in split_names:
             split = _require_mapping(splits.get(split_name), f"splits.{split_name}")
             files = split.get("files")
             if not isinstance(files, list) or not files:
                 raise ManifestValidationError(f"manifest splits.{split_name}.files must be a non-empty list.")
             for index, entry in enumerate(files):
-                manifest_file_path(entry, f"splits.{split_name}.files[{index}]")
+                field = f"splits.{split_name}.files[{index}]"
+                if document_unit == "file-pair":
+                    manifest_file_pair_paths(entry, field)
+                else:
+                    manifest_file_path(entry, field)
 
         if manifest["modality"] == "text":
-            self._validate_text_declarations(manifest)
+            self._validate_text_declarations(manifest, document_unit)
         return manifest
 
     @staticmethod
-    def _validate_text_declarations(manifest: Manifest) -> None:
+    def _validate_text_declarations(manifest: Manifest, document_unit: str) -> None:
         tokenizer = _require_mapping(manifest.get("tokenizer"), "tokenizer")
         _require_nonempty_string(tokenizer.get("name"), "tokenizer.name")
         for field in ("artifact", "lock"):
@@ -82,7 +104,8 @@ class ManifestValidatorV1:
         if tokenizer.get("fit_split") != "train": 
             raise ManifestValidationError("manifest tokenizer.fit_split must be 'train' for text datasets.")
         special_tokens = _require_mapping(tokenizer.get("special_tokens"), "tokenizer.special_tokens")
-        for token_name in ("pad", "eos"):
+        token_names = ("pad", "eos", "sep") if document_unit == "file-pair" else ("pad", "eos")
+        for token_name in token_names:
             _require_nonempty_string(special_tokens.get(token_name), f"tokenizer.special_tokens.{token_name}")
 
         locking = _require_mapping(manifest.get("locking"), "locking")

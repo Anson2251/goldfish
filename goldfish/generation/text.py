@@ -36,6 +36,7 @@ def generate_text(
     max_new_tokens: int,
     temperature: float | None = None,
     top_k: int | None = None,
+    prefix_token_ids: Sequence[int] = (),
     eos_token_id: int | None = None,
     return_token_ids: bool = False,
 ) -> str | list[int]:
@@ -51,7 +52,7 @@ def generate_text(
     if top_k is not None and top_k <= 0:
         raise ValueError("top_k must be positive")
 
-    token_ids = list(tokenizer.encode(prompt))
+    token_ids = list(tokenizer.encode(prompt)) + list(prefix_token_ids)
     if not token_ids:
         raise ValueError("prompt must encode to at least one token")
 

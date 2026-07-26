@@ -104,13 +104,15 @@ class Trainer(Generic[BatchT]):
         self.progress = progress
         self.epoch = -1
         self.global_step = 0
+        self._display_final_epoch: int | None = None
         self.model.to(self.device)
 
     def train_epoch(self, loader: Iterable[BatchT]) -> dict[str, float]:
         """Run one optimization epoch and return mean batch metrics."""
         self.model.train()
         metrics: list[dict[str, float]] = []
-        for batch in self._batches(loader, description=f"Epoch {self.epoch + 1} train", leave=True):
+        progress = self._batches(loader, description=self._progress_description("train"), leave=True)
+        for batch in progress:
             batch = batch.to(self.device)
             self.optimizer.zero_grad(set_to_none=True)
             output = self.model(batch)
@@ -124,19 +126,22 @@ class Trainer(Generic[BatchT]):
                 self._step_scheduler()
             self.global_step += 1
             metrics.append(self._as_metrics(loss, result.metrics))
+            progress.set_postfix(self._progress_metrics(metrics, include_learning_rate=True))
         return self._mean_metrics(metrics)
 
     def validate(self, loader: Iterable[BatchT]) -> dict[str, float]:
         """Run one validation epoch without gradient tracking."""
         self.model.eval()
         metrics: list[dict[str, float]] = []
+        progress = self._batches(loader, description=self._progress_description("val"), leave=False)
         with torch.no_grad():
-            for batch in self._batches(loader, description=f"Epoch {self.epoch + 1} validation", leave=False):
+            for batch in progress:
                 batch = batch.to(self.device)
                 output = self.model(batch)
                 result = self.task.compute(output, batch)
                 loss = self._total_loss(result.loss, output)
                 metrics.append(self._as_metrics(loss, result.metrics))
+                progress.set_postfix(self._progress_metrics(metrics, include_learning_rate=False))
         return self._mean_metrics(metrics)
 
     def fit(
@@ -153,6 +158,7 @@ class Trainer(Generic[BatchT]):
             raise ValueError("a validation scheduler requires val_loader")
 
         history: list[EpochResult] = []
+        self._display_final_epoch = self.epoch + epochs + 1
         for _ in range(epochs):
             self.epoch += 1
             train = self.train_epoch(train_loader)
@@ -232,7 +238,23 @@ class Trainer(Generic[BatchT]):
             raise KeyError(f"validation metric {self.scheduler_metric!r} was not recorded")
         return validation[metric_name]
 
-    def _batches(self, loader: Iterable[BatchT], *, description: str, leave: bool) -> Iterable[BatchT]:
+    def _progress_description(self, phase: str) -> str:
+        """Build a human-readable phase label without changing training semantics."""
+        current_epoch = self.epoch + 1
+        if self._display_final_epoch is None:
+            return f"Epoch {current_epoch} {phase}"
+        return f"Epoch {current_epoch}/{self._display_final_epoch} {phase}"
+
+    def _progress_metrics(self, batches: list[dict[str, float]], *, include_learning_rate: bool) -> dict[str, str]:
+        """Return generic running means for tqdm without task-specific metric names."""
+        means = self._mean_metrics(batches)
+        display = {name: f"{value:.4g}" for name, value in sorted(means.items())}
+        if include_learning_rate:
+            rates = self.learning_rates
+            display["lr"] = f"{rates[0]:.3g}" if len(rates) == 1 else ",".join(f"{rate:.3g}" for rate in rates)
+        return display
+
+    def _batches(self, loader: Iterable[BatchT], *, description: str, leave: bool) -> tqdm:
         """Create a per-epoch progress bar with the requested terminal retention."""
         return tqdm(loader, desc=description, leave=leave, disable=not self.progress)
 

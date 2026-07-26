@@ -5,8 +5,61 @@ from collections.abc import Iterable
 import torch
 from torch.utils.data import Dataset
 
-from .batch import LanguageModelBatch
+from .batch import LanguageModelBatch, PrefixLanguageModelBatch
 from .tokenizer import CharacterTokenizer, Tokenizer
+
+
+class FilePairPrefixLanguageModelDataset(Dataset[PrefixLanguageModelBatch]):
+    """Fixed-length prefix-LM rows for ``input -> output`` text-file pairs."""
+
+    def __init__(
+        self,
+        pairs: Iterable[tuple[str, str]],
+        tokenizer: CharacterTokenizer,
+        sequence_length: int,
+        *,
+        fit_tokenizer: bool = False,
+    ) -> None:
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive.")
+        if tokenizer.pad_token_id is None:
+            raise ValueError("FilePairPrefixLanguageModelDataset requires a tokenizer with a PAD token.")
+        if tokenizer.sep_token_id is None:
+            raise ValueError("FilePairPrefixLanguageModelDataset requires a tokenizer with a SEP token.")
+
+        pairs = tuple(pairs)
+        if fit_tokenizer:
+            tokenizer.fit(text for pair in pairs for text in pair)
+
+        self._rows = [self._encode_pair(input_text, output_text, tokenizer, sequence_length) for input_text, output_text in pairs]
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def __getitem__(self, index: int) -> PrefixLanguageModelBatch:
+        return self._rows[index]
+
+    @staticmethod
+    def _encode_pair(
+        input_text: str, output_text: str, tokenizer: CharacterTokenizer, sequence_length: int
+    ) -> PrefixLanguageModelBatch:
+        tokens = tokenizer.encode(input_text) + [tokenizer.sep_token_id] + tokenizer.encode(output_text) + [tokenizer.eos_token_id]
+        inputs, targets = tokens[:-1], tokens[1:]
+        if len(inputs) > sequence_length:
+            raise ValueError(
+                f"File pair requires {len(inputs)} tokens, exceeding sequence_length {sequence_length}."
+            )
+
+        valid_length = len(inputs)
+        output_start = len(tokenizer.encode(input_text))
+        loss_mask = [False] * output_start + [True] * (valid_length - output_start)
+        padding = sequence_length - valid_length
+        return PrefixLanguageModelBatch(
+            input_ids=torch.tensor(inputs + [tokenizer.pad_token_id] * padding, dtype=torch.long),
+            target_ids=torch.tensor(targets + [tokenizer.pad_token_id] * padding, dtype=torch.long),
+            attention_mask=torch.tensor([True] * valid_length + [False] * padding, dtype=torch.bool),
+            loss_mask=torch.tensor(loss_mask + [False] * padding, dtype=torch.bool),
+        )
 
 
 class CausalLanguageModelDataset(Dataset[LanguageModelBatch]):

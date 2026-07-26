@@ -43,12 +43,18 @@ class Tokenizer(Protocol):
 
 
 class CharacterTokenizer:
-    """A deterministic character tokenizer with PAD and EOS special tokens."""
+    """A deterministic character tokenizer with optional SEP support.
+
+    PAD and EOS always retain IDs 0 and 1. SEP is opt-in so existing character
+    tokenizer artifacts and their character IDs remain unchanged.
+    """
 
     _pad_token_id = 0
     _eos_token_id = 1
+    _sep_token_id = 2
 
-    def __init__(self) -> None:
+    def __init__(self, *, with_sep_token: bool = False) -> None:
+        self._with_sep_token = with_sep_token
         self._token_to_id: dict[str, int] = {}
         self._id_to_token: dict[int, str] = {}
         self._fitted = False
@@ -62,13 +68,19 @@ class CharacterTokenizer:
         return self._eos_token_id
 
     @property
+    def sep_token_id(self) -> int | None:
+        """Separator token ID when this tokenizer was configured with SEP."""
+        return self._sep_token_id if self._with_sep_token else None
+
+    @property
     def vocab_size(self) -> int:
-        return len(self._token_to_id) + 2
+        return len(self._token_to_id) + 2 + int(self._with_sep_token)
 
     def fit(self, texts: Iterable[str]) -> None:
         """Create an ID mapping sorted lexicographically by character."""
         characters = {character for text in texts for character in text}
-        self._token_to_id = {character: index for index, character in enumerate(sorted(characters), start=2)}
+        start = self._sep_token_id + 1 if self._with_sep_token else self._eos_token_id + 1
+        self._token_to_id = {character: index for index, character in enumerate(sorted(characters), start=start)}
         self._id_to_token = {index: character for character, index in self._token_to_id.items()}
         self._fitted = True
 
@@ -83,7 +95,7 @@ class CharacterTokenizer:
         self._require_fitted()
         characters: list[str] = []
         for token_id in token_ids:
-            if token_id in (self.pad_token_id, self.eos_token_id):
+            if token_id in (self.pad_token_id, self.eos_token_id, self.sep_token_id):
                 continue
             try:
                 characters.append(self._id_to_token[token_id])
@@ -100,6 +112,7 @@ class CharacterTokenizer:
                     "type": "character",
                     "pad_token_id": self.pad_token_id,
                     "eos_token_id": self.eos_token_id,
+                    **({"sep_token_id": self._sep_token_id} if self._with_sep_token else {}),
                     "token_to_id": self._token_to_id,
                 },
                 ensure_ascii=False,
@@ -123,6 +136,11 @@ class CharacterTokenizer:
         if artifact.get("pad_token_id") != cls._pad_token_id or artifact.get("eos_token_id") != cls._eos_token_id:
             raise ValueError("Character tokenizer artifact has incompatible special token IDs.")
 
+        sep_token_id = artifact.get("sep_token_id")
+        if sep_token_id not in (None, cls._sep_token_id):
+            raise ValueError("Character tokenizer artifact has incompatible special token IDs.")
+        with_sep_token = sep_token_id == cls._sep_token_id
+
         token_to_id = artifact.get("token_to_id")
         if not isinstance(token_to_id, dict) or not all(
             isinstance(character, str) and len(character) == 1 and isinstance(token_id, int)
@@ -130,10 +148,11 @@ class CharacterTokenizer:
         ):
             raise ValueError("Character tokenizer artifact has an invalid token_to_id mapping.")
         ids = list(token_to_id.values())
-        if len(set(ids)) != len(ids) or set(ids) != set(range(2, len(ids) + 2)):
-            raise ValueError("Character tokenizer artifact token IDs must be contiguous starting at 2.")
+        first_character_id = cls._sep_token_id + 1 if with_sep_token else cls._eos_token_id + 1
+        if len(set(ids)) != len(ids) or set(ids) != set(range(first_character_id, len(ids) + first_character_id)):
+            raise ValueError(f"Character tokenizer artifact token IDs must be contiguous starting at {first_character_id}.")
 
-        tokenizer = cls()
+        tokenizer = cls(with_sep_token=with_sep_token)
         tokenizer._token_to_id = dict(token_to_id)
         tokenizer._id_to_token = {token_id: character for character, token_id in token_to_id.items()}
         tokenizer._fitted = True

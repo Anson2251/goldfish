@@ -204,6 +204,188 @@ tokenizer:
     eos: "<eos>"
 ```
 
+## File-pair text datasets
+
+Goldfish v1 supports supervised text `input -> output` datasets with:
+
+```yaml
+format:
+  encoding: utf-8
+  document_unit: file-pair
+```
+
+A `file-pair` dataset uses the existing causal GRU/LSTM language models in **prefix language-model** mode. It is not yet a separate encoder-decoder/seq2seq architecture.
+
+### File-pair manifest
+
+Every split must be present and each entry explicitly names its input and output file. Paths are relative to the dataset root.
+
+```yaml
+name: reverse_pairs
+version: "1.0"
+modality: text
+builder: text_file_pairs
+task: prefix_language_model
+
+format:
+  encoding: utf-8
+  document_unit: file-pair
+
+splits:
+  train:
+    files:
+      - input: train/01-input.txt
+        output: train/01-output.txt
+      - input: train/02-input.txt
+        output: train/02-output.txt
+  val:
+    files:
+      - input: val/01-input.txt
+        output: val/01-output.txt
+  test:
+    files:
+      - input: test/01-input.txt
+        output: test/01-output.txt
+
+tokenizer:
+  name: character
+  artifact: tokenizer/tokenizer.json
+  lock: tokenizer/tokenizer-lock.json
+  fit_split: train
+  special_tokens:
+    pad: "<pad>"
+    eos: "<eos>"
+    sep: "<sep>"
+
+locking:
+  dataset_lock: dataset-lock.json
+```
+
+For `document_unit: file-pair`:
+
+- `train`, `val`, and `test` splits are required by manifest v1;
+- every entry must be a mapping with non-empty `input` and `output` paths;
+- both paths must be safe dataset-relative paths; absolute paths and traversal are rejected;
+- `tokenizer.special_tokens.sep` is required;
+- a manifest `input`/`output` entry is one paired **shard**; no pairing is inferred from file names.
+
+### Multi-line paired shards
+
+A paired shard may contain many supervised examples. Goldfish aligns it strictly by line number:
+
+```text
+train/inputs.txt             train/outputs.txt
+----------------             -----------------
+translate: cat               chat
+translate: dog               chien
+```
+
+This produces two examples:
+
+```text
+"translate: cat" -> "chat"
+"translate: dog" -> "chien"
+```
+
+Rules:
+
+- line `N` in the input file pairs with line `N` in the output file;
+- both files must contain exactly the same number of lines;
+- empty lines are retained as valid empty input/output examples to preserve alignment;
+- a mismatched line count is an error; Goldfish never silently truncates either side;
+- manifest ordering first orders shards, then preserves line order inside each shard.
+
+A shard may still contain one line. Thus `file-pair` supports both a single example and efficiently stored collections of short examples.
+
+### Prefix-LM representation and loss
+
+For one pair:
+
+```text
+input file:  abc
+output file: cba
+```
+
+Goldfish encodes the sequence as:
+
+```text
+abc <sep> cba <eos>
+```
+
+The model consumes the normal shifted causal-LM inputs/targets. The dataset also emits `loss_mask`, so next-token cross-entropy is calculated only for predictions belonging to the output segment and its terminating EOS:
+
+```text
+context:        abc <sep>
+loss targets:             c b a <eos>
+```
+
+Input and separator positions provide conditioning context but are excluded from optimization loss. The `PrefixLanguageModelTask` applies:
+
+```text
+effective_loss_mask = attention_mask AND loss_mask
+```
+
+This lets file-pair training reuse the current recurrent causal language-model architectures while making the supervised target boundary explicit.
+
+### Tokenizer behavior
+
+Tokenizer fitting reads both sides of **training pairs only**:
+
+```text
+all train inputs + all train outputs
+-> fit tokenizer
+-> encode train, val, and test with the frozen tokenizer
+```
+
+For the character tokenizer, a file-pair tokenizer reserves:
+
+```text
+PAD = 0
+EOS = 1
+SEP = 2
+characters begin at ID 3
+```
+
+The existing non-paired character tokenizer remains compatible with legacy artifacts and uses only PAD/EOS special tokens.
+
+### Preparation, training, and inference
+
+Prepare a file-pair dataset through the normal workflow:
+
+```sh
+uv run goldfish prepare data/reverse-pairs
+```
+
+Preparation detects `document_unit: file-pair`, creates a SEP-enabled tokenizer from train pairs, then writes dataset and tokenizer locks.
+
+Training selects the matching DataModule and task from the manifest:
+
+| Document unit | Data module | Task |
+|---|---|---|
+| `file` | `TextFilesLanguageModelDataModule` | `CausalLanguageModelTask` |
+| `file-pair` | `FilePairPrefixLanguageModelDataModule` | `PrefixLanguageModelTask` |
+
+```sh
+uv run goldfish train data/reverse-pairs --name reverse-gru --model gru
+```
+
+For a paired run, inference accepts the input side through `--prompt`; Goldfish appends the dataset SEP token internally before autoregressive output generation:
+
+```sh
+uv run goldfish infer runs/exp1-reverse-gru \
+  --checkpoint best \
+  --prompt "abc" \
+  --max-new-tokens 20
+```
+
+Users must not include `<sep>` themselves in the prompt.
+
+### Current v1 limitations
+
+- This is prefix-LM conditioning, not an encoder-decoder model with cross-attention.
+- Each tokenized line-level `input + SEP + output + EOS` example must fit into one configured `sequence_length`; oversized examples fail clearly rather than being silently truncated.
+- The first implementation supports text file pairs only. Numeric/multimodal input-output pairs remain future dataset builders.
+
 ## Numeric sequential datasets
 
 Numeric datasets use the same root/split/manifest layout, but files normally represent time partitions, entities, or shards instead of text documents.
@@ -321,10 +503,12 @@ Goldfish separates declarative dataset definition from derived integrity snapsho
 
 `dataset-lock.json` stores SHA-256 hashes for each manifest-listed raw file, preserving manifest order and split membership. It also stores split fingerprints and one overall dataset fingerprint.
 
+For `document_unit: file-pair`, a locked entry stores separate `input` and `output` snapshots. The pair role is part of its identity, so exchanging input/output files changes the lock even when their contents are unchanged.
+
 A split fingerprint is computed over canonical ordered entries containing at least:
 
 ```text
-split name + relative path + file content SHA-256
+split name + ordered entry identity + relative path(s) + file content SHA-256
 ```
 
 The overall fingerprint additionally covers lock-relevant manifest semantics, such as builder, modality, format, and tokenizer configuration. A canonical JSON serialization (UTF-8, sorted object keys, fixed separators) is hashed with SHA-256. The lock payload never contains its own fingerprint.

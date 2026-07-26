@@ -13,5 +13,7 @@ wheels/
 /data/*
 !/data/alphabet/
 !/data/alphabet/**
+!/data/repeat/
+!/data/repeat/**
 /artifacts
 /runs
