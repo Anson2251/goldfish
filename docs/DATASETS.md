@@ -388,61 +388,162 @@ Users must not include `<sep>` themselves in the prompt.
 
 ## Numeric sequential datasets
 
-Numeric datasets use the same root/split/manifest layout, but files normally represent time partitions, entities, or shards instead of text documents.
+`numeric_files_forecast` is the initial numeric builder. It supports ordered, multi-entity CSV shards for point forecasting. A manifest-listed file is one **shard**, not one entity; a given entity may continue across shards. The loader uses manifest order exclusively and never discovers or sorts files from the filesystem.
 
 ```text
 data/
-└── aapl-5m-return/
+└── example-bars/
     ├── manifest.yaml
     ├── dataset-lock.json
     ├── train/
-    │   └── bars-2022.parquet
+    │   ├── 01-bars.csv
+    │   └── 02-bars.csv
     ├── val/
-    │   └── bars-2023-q1.parquet
-    └── test/
-        └── bars-2023-q2.parquet
+    │   └── 01-bars.csv
+    ├── test/
+    │   └── 01-bars.csv
+    └── preprocessing/
+        ├── normalizer.json
+        └── normalizer-lock.json
 ```
 
-A numeric manifest must eventually declare time and feature semantics, especially feature availability and normalization ownership:
+Shards should use zero-padded ordinal prefixes (`01-`, `02-`, …) as an authoring convention. The manifest remains authoritative: numbering makes the intended order easy to audit but does not override the order declared under `splits`.
+
+### Numeric forecast manifest
+
+A numeric dataset explicitly declares its CSV, time, entity, feature, target, window, and preprocessing semantics:
 
 ```yaml
-name: aapl_5m_return
+name: example-bars
 version: "1.0"
 modality: numeric
 builder: numeric_files_forecast
 task: point_forecast
 
+format:
+  file_type: csv
+  delimiter: ","
+  timestamp_column: timestamp
+  entity_column: entity_id
+  sort_order: ascending
+
+schema:
+  features: [open, high, low, close, volume]
+  targets: [close]
+  dtypes:
+    timestamp: datetime
+    entity_id: string
+    open: double
+    high: double
+    low: double
+    close: double
+    volume: int
+
+window:
+  lookback: 64
+  horizons: [1, 5, 20]
+
+normalization:
+  name: standard
+  fit_split: train
+  artifact: preprocessing/normalizer.json
+  lock: preprocessing/normalizer-lock.json
+
 splits:
   train:
-    files: [train/bars-2022.parquet]
+    files:
+      - train/01-bars.csv
+      - train/02-bars.csv
   val:
-    files: [val/bars-2023-q1.parquet]
+    files:
+      - val/01-bars.csv
   test:
-    files: [test/bars-2023-q2.parquet]
+    files:
+      - test/01-bars.csv
 
-time:
-  timezone: America/New_York
-  frequency: 5m
-  context_window: 78
-  forecast_horizons: [1h]
-
-features:
-  - name: log_return
-    availability: observed
-    normalization: standard
-  - name: volume
-    availability: observed
-    transform: log1p
-    normalization: standard
-  - name: minute_of_day_sin
-    availability: known_future
-
-target:
-  name: future_log_return
-  horizon: 1h
+locking:
+  dataset_lock: dataset-lock.json
 ```
 
-Numeric normalizers must be fit on the training split only. Chronological split boundaries, timezone, horizon, and any embargo are part of the dataset contract because they affect leakage safety.
+### Numeric manifest field reference
+
+| Field | Required | Allowed values / shape | Meaning |
+|---|---:|---|---|
+| `name` | Yes | Non-empty string | Stable dataset identifier. |
+| `version` | Yes | Manifest version string; currently `"1.0"` | Dataset-contract version. Increment the dataset version when semantics change. |
+| `modality` | Yes | `numeric` | Selects numeric manifest validation. |
+| `builder` | Yes | `numeric_files_forecast` | Selects ordered multi-entity CSV forecasting behavior. |
+| `task` | Yes | `point_forecast` | Declares a point-value forecast target. |
+| `format.file_type` | Yes | `csv` | Raw shard format for this builder. |
+| `format.delimiter` | No | Single-character CSV delimiter; default `,` | CSV field separator. |
+| `format.timestamp_column` | Yes | One declared column name | RFC 3339 timestamp, with either a numeric UTC offset or `Z`; used to order rows per entity. Fractional seconds are accepted. |
+| `format.entity_column` | Yes | One declared column name distinct from timestamp | Entity/group identifier; it repeats across the rows of one entity, and windows never cross entities. |
+| `format.sort_order` | Yes | `ascending` | Requires strictly increasing timestamps within each entity and split. |
+| `schema.features` | Yes | Non-empty ordered list of distinct column names | Observed numeric inputs at each cutoff. Order defines model feature order and normalizer order. |
+| `schema.targets` | Yes | Non-empty ordered list of distinct feature names | Values forecast at each configured horizon. A target is initially required to also be an observed feature. |
+| `schema.dtypes` | Yes | Mapping for timestamp, entity, every feature, and every target | Declares the supported scalar type for each referenced column. |
+| `schema.dtypes.<timestamp>` | Yes | `datetime` | RFC 3339 parser type. A numeric UTC offset or `Z` is required; naive timestamps are rejected and instants are compared in UTC. |
+| `schema.dtypes.<entity>` | Yes | `string` | Non-empty entity identifier type. The same ID occurs once per observation in that entity's sequence. |
+| `schema.dtypes.<feature-or-target>` | Yes | `double` or `int` | Numeric CSV type. Values must parse cleanly and be finite. Integer values are converted to the numeric tensor representation during loading. |
+| `window.lookback` | Yes | Positive integer | Number of consecutive same-entity rows available to a prediction, including the cutoff row. |
+| `window.horizons` | Yes | Non-empty ordered list of unique positive integers | Subsequent same-entity row offsets to forecast, such as `[1, 5, 20]`. These are not elapsed-time durations. |
+| `normalization.name` | Yes | `standard` | Train-only feature normalization algorithm. |
+| `normalization.fit_split` | Yes | `train` | The only split from which normalizer statistics may be fitted. |
+| `normalization.artifact` | Yes | Safe dataset-relative path | Destination for frozen normalizer state. |
+| `normalization.lock` | Yes | Safe dataset-relative path | Destination for the normalizer integrity lock. |
+| `splits.<split>.files` | Yes | Ordered, non-empty list of safe dataset-relative CSV paths | Manifest-authoritative shard membership and order for `train`, `val`, and `test`. |
+| `locking.dataset_lock` | Yes | Safe dataset-relative path | Destination for the raw shard and manifest-semantics lock. |
+
+The initial builder has these intentional constraints:
+
+- `train`, `val`, and `test` are all required and must list one or more shard paths;
+- `timestamp_column` and `entity_column` are required and must be distinct;
+- each row is uniquely identified by the compound key `(entity_id, timestamp)` within the dataset: an entity ID may repeat across its observations, while different entities may share a timestamp;
+- feature/target columns must not include the timestamp or entity column;
+- the builder supports `datetime` only for the timestamp column, `string` only for the entity column, and `double`/`int` only for declared features and targets; no other declared columns are supported in v1;
+- undeclared CSV columns are permitted and ignored; only declared columns participate in validation, preprocessing, windows, and locks;
+- `lookback` is a positive row count, and `horizons` is a non-empty ordered list of unique positive row offsets;
+- row-step horizons refer to subsequent observations of the **same entity**, not elapsed wall-clock time;
+- normalizer fitting is fixed to `fit_split: train`.
+
+Future builders may add Parquet, known-future covariates, explicit target columns, real-time horizons, nullable types, or additional numeric precision classes. Those are not implied by this first CSV builder.
+
+### Numeric preparation validation
+
+`prepare` is the only operation that performs full numeric content validation. It reads every manifest-listed CSV shard in split and manifest order, then fails rather than repairing or dropping invalid data when any of the following conditions occurs:
+
+- a shard cannot be read as UTF-8 CSV with the declared delimiter;
+- its header is empty, has duplicate names, or omits a declared column;
+- a timestamp is not RFC 3339, has neither a numeric UTC offset nor `Z`, or cannot be normalized to UTC;
+- an entity ID is empty;
+- a `double` feature or target value is empty, non-numeric, `NaN`, or infinite;
+- an `int` feature or target value is empty, non-numeric, non-integral, or outside the implementation's supported integer range;
+- a numeric value cannot be represented according to its declared dtype;
+- the compound key `(entity_id, timestamp)` is duplicated within a split after its ordered shards are concatenated; or
+- timestamps for the same entity are not strictly increasing within a split after its ordered shards are concatenated.
+
+For every entity, timestamps in any earlier split in the order `train`, `val`, `test` must strictly precede timestamps in every later split where that entity is present. Thus a compound key may not be duplicated across splits, even when the entity is absent from an intermediate split. An entity may be absent from one or more splits. This makes split history unambiguous: validation/test rows obtain prior history from earlier splits rather than from duplicated historical copies. Unlisted files are ignored.
+
+### Windows and split boundaries
+
+Rows are grouped and windowed independently for each entity. With `lookback: 3` and `horizons: [1, 2]`:
+
+```text
+input rows:  [t0, t1, t2]      cutoff: t2
+target rows: [t3, t4]
+```
+
+A train window has its cutoff and every target row in `train`. A validation window may use preceding `train` history plus preceding validation rows as input, but its cutoff and every target row must belong to `val`. A test window may use preceding train, validation, and test history, but its cutoff and every target row must belong to `test`.
+
+This preserves realistic warm-up history without allowing a future split's labels into a prior split's optimization or evaluation. A split/entity combination with insufficient in-split target rows produces no windows; it is valid but must be reported in runtime metadata.
+
+### Normalization
+
+The first builder uses a standard feature normalizer. During `prepare`, it computes the per-feature mean and **population** standard deviation (`ddof=0`) from **training split rows only**, in manifest-declared feature order. For each feature, it traverses rows in train split, manifest shard, and CSV-row order and applies Welford's online algorithm using IEEE 754 binary64 arithmetic; the population variance is `M2 / row_count` and the scale is its non-negative square root. Statistics are stored as IEEE 754 double-precision values. For a zero-variance feature, the stored scale is `1.0`, so its normalized value is always `0.0`.
+
+`preprocessing/normalizer.json` contains the artifact format, normalizer name, ordered feature names, double-precision `means` and `scales`, training-row count, source train fingerprint, and normalization configuration. Every feature, including a feature also declared as a target, is normalized with its own fitted parameters. Thus target tensors are normalized; future task evaluation and prediction export must inverse-transform target predictions and values to raw units before reporting user-facing metrics or artifacts.
+
+Validation/test data is transformed only with this frozen artifact. It is never used to fit or update statistics.
 
 ## Multimodal datasets
 
@@ -496,8 +597,10 @@ Goldfish separates declarative dataset definition from derived integrity snapsho
 |---|---|
 | `manifest.yaml` | Dataset semantics: split members and order, modality, builder, format, tokenizer configuration, and feature/target/time definitions. |
 | `dataset-lock.json` | Immutable snapshot of manifest-listed raw split files and lock-relevant manifest semantics. |
-| `tokenizer/tokenizer.json` | Actual text token-to-ID mapping. |
-| `tokenizer/tokenizer-lock.json` | Binding from the tokenizer artifact to the locked training split and tokenizer configuration. |
+| `tokenizer/tokenizer.json` | Actual text token-to-ID mapping for text builders. |
+| `tokenizer/tokenizer-lock.json` | Binding from a text tokenizer artifact to the locked training split and tokenizer configuration. |
+| `preprocessing/normalizer.json` | Frozen train-only numeric feature-normalizer artifact for `numeric_files_forecast`. |
+| `preprocessing/normalizer-lock.json` | Binding from the numeric normalizer artifact to the locked training split, feature schema, and normalization configuration. |
 
 ### Dataset lock
 
@@ -511,7 +614,7 @@ A split fingerprint is computed over canonical ordered entries containing at lea
 split name + ordered entry identity + relative path(s) + file content SHA-256
 ```
 
-The overall fingerprint additionally covers lock-relevant manifest semantics, such as builder, modality, format, and tokenizer configuration. A canonical JSON serialization (UTF-8, sorted object keys, fixed separators) is hashed with SHA-256. The lock payload never contains its own fingerprint.
+The overall fingerprint additionally covers lock-relevant manifest semantics, such as builder, modality, format, tokenizer configuration, numeric schema, windows, and normalization configuration. A canonical JSON serialization (UTF-8, sorted object keys, fixed separators) is hashed with SHA-256. The lock payload never contains its own fingerprint.
 
 This means the lock changes when file content, file order, split membership, or data-interpretation settings change.
 
@@ -568,30 +671,68 @@ Example shape:
 }
 ```
 
+### Preprocessing lock
+
+`preprocessing/normalizer-lock.json` confirms that `normalizer.json` is unmodified and derived from the current locked training split using the declared feature schema and normalization configuration.
+
+```json
+{
+  "format": "goldfish-normalizer-lock-v1",
+  "algorithm": "sha256",
+  "normalizer": {
+    "path": "normalizer.json",
+    "sha256": "<sha256>",
+    "name": "standard",
+    "features": ["open", "high", "low", "close", "volume"]
+  },
+  "source": {
+    "dataset_name": "example-bars",
+    "dataset_version": "1.0",
+    "train_fingerprint": "<dataset-lock train fingerprint>"
+  },
+  "config": {
+    "features": ["open", "high", "low", "close", "volume"],
+    "normalization": {"name": "standard", "fit_split": "train"}
+  },
+  "fingerprint": "<sha256>"
+}
+```
+
 ### Lock lifecycle
 
-Dataset preparation is explicit:
+Dataset preparation is explicit. Text and numeric builders prepare different train-only state:
 
 ```text
+text:
 read manifest + raw train files
 -> fit tokenizer from train only
 -> write tokenizer.json
 -> calculate dataset-lock.json
 -> calculate tokenizer-lock.json
 -> dataset is locked
+
+numeric_files_forecast:
+read manifest + all manifest-listed CSV shards
+-> validate CSV/schema/entity/time invariants
+-> calculate dataset-lock.json
+-> fit feature normalizer from train only
+-> write normalizer.json with the dataset-lock train fingerprint
+-> calculate normalizer-lock.json
+-> dataset is locked
 ```
 
-Training verifies locks in this order:
+Future training verifies only the locks and frozen preprocessing artifacts; it does not repeat full numeric CSV quality validation:
 
 ```text
 read manifest.yaml
 -> verify dataset-lock.json against manifest-listed raw files
--> verify tokenizer-lock.json against tokenizer.json, train fingerprint, and manifest tokenizer config
--> load datasets and tokenizer
+-> text: verify tokenizer lock and tokenizer artifact
+-> numeric: verify normalizer lock and normalizer artifact
+-> load datasets with frozen preprocessing
 -> train
 ```
 
-Training must fail on any mismatch and must not silently rewrite locks or refit tokenizer state. If raw training data or tokenizer configuration changes, the user explicitly rebuilds tokenizer artifacts, regenerates locks, and increments the dataset version as appropriate.
+Training must fail on any mismatch and must not silently rewrite locks or refit preprocessing state. If raw data, schema/window semantics, tokenizer configuration, or normalization configuration changes, the user explicitly prepares the dataset again and increments its version as appropriate.
 
 ## Run artifacts and integrity
 
