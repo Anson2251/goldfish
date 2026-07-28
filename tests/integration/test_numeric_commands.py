@@ -123,6 +123,35 @@ def test_numeric_training_strictly_resumes_from_latest_checkpoint(tmp_path: Path
         load_entry("train")([str(dataset), "--resume", str(run), "--epochs", "1", "--model-profile", str(ROOT / "model-profiles" / "forecast" / "lstm-small.yaml")])
 
 
+def test_numeric_loose_resume_allows_learning_rate_override_and_resets_optimizer_state(tmp_path: Path) -> None:
+    dataset, runs = tmp_path / "dataset", tmp_path / "runs"
+    write_numeric_bundle(dataset)
+    assert load_entry("prepare")([str(dataset)]) == 0
+    assert load_entry("train")([
+        str(dataset), "--runs-dir", str(runs), "--name", "loose", "--epochs", "1", "--batch-size", "2",
+        "--num-workers", "0", "--model-profile", str(FORECAST_PROFILE),
+    ]) == 0
+
+    run = runs / "exp1-loose"
+    before = torch.load(run / "checkpoints" / "latest.pt", weights_only=False)
+    assert before["optimizer"]["state"]
+    with pytest.raises(ValueError, match="resume optimization configuration"):
+        load_entry("train")([str(dataset), "--resume", str(run), "--epochs", "1", "--learning-rate", "0.0001"])
+
+    assert load_entry("train")([
+        str(dataset), "--resume", str(run), "--resume-loose", "--epochs", "1", "--learning-rate", "0.0001",
+        "--batch-size", "1", "--num-workers", "0",
+    ]) == 0
+
+    checkpoint = torch.load(run / "checkpoints" / "final.pt", weights_only=False)
+    records = [json.loads(line) for line in (run / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert checkpoint["epoch"] == 1
+    assert checkpoint["global_step"] == 5
+    assert records[-1]["learning_rate"] == pytest.approx(0.0001)
+    assert checkpoint["optimizer"]["param_groups"][0]["lr"] == pytest.approx(0.0001)
+    assert checkpoint["optimizer"]["state"]
+
+
 def test_forecast_exports_raw_unit_predictions_and_text_infer_rejects_numeric_run(tmp_path: Path) -> None:
     dataset, runs = tmp_path / "dataset", tmp_path / "runs"
     write_numeric_bundle(dataset)

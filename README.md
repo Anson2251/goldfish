@@ -133,6 +133,18 @@ Model architectures are selected with a required YAML profile:
 
 Profiles supply architecture-owned parameters and model registry identity. Goldfish injects data-derived dimensions (vocabulary size or numeric feature/target/horizon counts), then saves the complete resolved model configuration in the run. This keeps new model-specific hyperparameters out of the training CLI.
 
+### Compilation
+
+Use `--compile` to run model forward passes through `torch.compile`. Goldfish keeps checkpoint state dictionaries in the uncompiled model format, so checkpoints remain compatible with `infer` and `forecast` without compilation.
+
+```sh
+uv run goldfish train data/fourier-lb256 \
+  --model-profile model-profiles/forecast/lstm-lb256-128x2.yaml \
+  --compile
+```
+
+Compilation has a one-time startup cost; it is usually most useful for longer runs. The resolved value is saved in `config.yaml` and cannot be changed while resuming a run.
+
 ### Device selection
 
 Both training and inference accept:

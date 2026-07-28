@@ -15,6 +15,7 @@ dependencies = [
     "torch==2.6.0",
     "tqdm>=4.69.1",
     "matplotlib>=3.11.1",
+    "torchinfo>=1.8.0",
 ]
 
 [project.scripts]

@@ -18,6 +18,7 @@ from typing import Any, cast
 import numpy
 import torch
 import yaml
+from torchinfo import summary
 
 from goldfish.config import create_model_from_config, create_optimizer, create_scheduler, load_model_profile, resolve_model_config, resolve_training_config
 from goldfish.data.loading import resolve_loader_settings
@@ -28,7 +29,7 @@ from goldfish.generation import generate_text
 from goldfish.generation.text import TextTokenizer
 
 from goldfish.tasks import CausalLanguageModelTask, PointForecastTask, PrefixLanguageModelTask
-from goldfish.training import Trainer
+from goldfish.training import Trainer, compile_model
 
 
 def _future_attribute(module_name: str, name: str) -> Any:
@@ -88,7 +89,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runs-dir", type=Path, default=Path("runs"), help="Experiment run directory (default: runs).")
     parser.add_argument("--device", choices=("cpu", "cuda", "mps"), help="Execution device; defaults to CUDA, then MPS, then CPU.")
     parser.add_argument("--name", help="Optional name appended to a new run directory.")
-    parser.add_argument("--resume", type=Path, metavar="RUN_DIR", help="Strictly resume an existing run from latest.pt.")
+    parser.add_argument("--resume", type=Path, metavar="RUN_DIR", help="Resume an existing run from latest.pt.")
+    parser.add_argument("--resume-loose", action="store_true", help="Allow loader and optimization overrides while preserving the run's model and data locks.")
     parser.add_argument("--sequence-length", type=int, default=64, help="Tokens in each training window (default: 64).")
     parser.add_argument("--batch-size", type=int, default=32, help="Training and validation batch size (default: 32).")
     parser.add_argument("--num-workers", default="auto", help="Total DataLoader worker budget: 'auto' reserves 20%% CPU and splits the rest 60:40 (default: auto).")
@@ -117,6 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", type=int, default=100, help="Maximum tokens to generate (default: 100).")
     parser.add_argument("--seed", type=int, help="Optional random seed; required with --deterministic.")
     parser.add_argument("--deterministic", action="store_true", help="Require deterministic PyTorch algorithms; requires --seed.")
+    parser.add_argument("--compile", action="store_true", help="Compile model forward execution with torch.compile.")
     return parser
 
 
@@ -189,7 +192,7 @@ def _resolved_config(args: argparse.Namespace, manifest: Mapping[str, Any], mode
         "model": dict(model),
         "task": {"name": manifest.get("task")},
         **resolved.to_mapping(),
-        "training": {"epochs": args.epochs, "device": args.device, "gradient_clip_norm": args.gradient_clip_norm},
+        "training": {"epochs": args.epochs, "device": args.device, "gradient_clip_norm": args.gradient_clip_norm, "compile": args.compile},
         "checkpointing": {"monitor": "validation/loss", "mode": "min", "save_frequency": args.checkpoint_frequency},
         "generation": {"prompt": prompt, "max_new_tokens": args.max_new_tokens, "sample_frequency": args.sample_frequency},
     }
@@ -233,6 +236,7 @@ def _resume_config(args: argparse.Namespace, config: dict[str, Any]) -> dict[str
         raise ValueError("--model-profile cannot be used when resuming; the run's saved model config is authoritative.")
     option_sections = {
         "experiment": {"seed", "deterministic"},
+        "training": {"compile"},
         "model": {"model_profile"},
         "loader": {"sequence_length", "batch_size"},
         "optimization": {"optimizer", "learning_rate", "weight_decay", "momentum"},
@@ -245,26 +249,37 @@ def _resume_config(args: argparse.Namespace, config: dict[str, Any]) -> dict[str
     return config
 
 
-def _restore_experiment_checkpoint(trainer: Trainer[Any], path: Path, *, run: ExperimentRun, provenance: Mapping[str, Any]) -> None:
+def _restore_experiment_checkpoint(
+    trainer: Trainer[Any],
+    path: Path,
+    *,
+    run: ExperimentRun,
+    provenance: Mapping[str, Any],
+    restore_optimizer_state: bool,
+) -> None:
     checkpoint = torch.load(path, map_location=trainer.device, weights_only=False)
     if not isinstance(checkpoint, dict) or checkpoint.get("format") != CHECKPOINT_FORMAT:
         raise ValueError("resume checkpoint has an unsupported format")
     checkpoint_provenance = checkpoint.get("provenance")
     if not isinstance(checkpoint_provenance, Mapping):
         raise ValueError("resume checkpoint is missing provenance")
-    for key in ("run_id", "config_fingerprint", "dataset_fingerprint", "tokenizer_fingerprint", "normalizer_fingerprint", "model_family", "model_name"):
+    provenance_keys = ("run_id", "dataset_fingerprint", "tokenizer_fingerprint", "normalizer_fingerprint", "model_family", "model_name")
+    if restore_optimizer_state:
+        provenance_keys = ("config_fingerprint", *provenance_keys)
+    for key in provenance_keys:
         if checkpoint_provenance.get(key) != provenance.get(key):
             raise ValueError(f"resume checkpoint provenance mismatch for {key}")
     trainer.model.load_state_dict(checkpoint["model"])
-    trainer.optimizer.load_state_dict(checkpoint["optimizer"])
-    scheduler_state = checkpoint.get("scheduler")
-    if trainer.scheduler is None:
-        if scheduler_state is not None:
-            raise ValueError("resume checkpoint has a scheduler but this run does not")
-    elif scheduler_state is None:
-        raise ValueError("resume checkpoint has no scheduler for this run")
-    else:
-        trainer.scheduler.load_state_dict(scheduler_state)
+    if restore_optimizer_state:
+        trainer.optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler_state = checkpoint.get("scheduler")
+        if trainer.scheduler is None:
+            if scheduler_state is not None:
+                raise ValueError("resume checkpoint has a scheduler but this run does not")
+        elif scheduler_state is None:
+            raise ValueError("resume checkpoint has no scheduler for this run")
+        else:
+            trainer.scheduler.load_state_dict(scheduler_state)
     trainer.epoch = int(checkpoint["epoch"])
     trainer.global_step = int(checkpoint["global_step"])
 
@@ -323,10 +338,6 @@ def _format_metrics(metrics: Mapping[str, float] | None) -> str:
     return " | ".join(f"{name} {value:.4f}" for name, value in sorted(metrics.items()))
 
 
-def _parameter_count(model: torch.nn.Module) -> tuple[int, int]:
-    total = sum(parameter.numel() for parameter in model.parameters())
-    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-    return total, trainable
 
 
 def _print_run_header(
@@ -348,7 +359,6 @@ def _print_run_header(
     locking = cast(Mapping[str, Any], data["locking"])
     tokenizer = cast(Mapping[str, Any], data.get("tokenizer", {}))
     experiment = cast(Mapping[str, Any], config["experiment"])
-    total, trainable = _parameter_count(model)
     mode = "resuming" if resume else "new run"
     print(f"Goldfish — {mode}")
     print(f"  Run:        {run.path}")
@@ -361,10 +371,13 @@ def _print_run_header(
     print(f"  Loader:     train_workers={loader.get('train_workers', loader.get('num_workers', 0))}, val_workers={loader.get('validation_workers', loader.get('num_workers', 0))}, pin_memory={loader.get('pin_memory', False)}, prefetch={loader.get('prefetch_factor')}, persistent={loader.get('persistent_workers', False)}")
     details = ", ".join(f"{key}={value}" for key, value in model_parameters.items())
     print(f"  Model:      {model_config['family']}/{model_config['name']} ({model_shape}{details})")
+    print(f"  Compile:    {bool(cast(Mapping[str, Any], config['training']).get('compile', False))}")
     print(f"  Reproduce:  deterministic={experiment.get('deterministic', False)}, seed={experiment.get('seed')}")
     if config["training"]["device"] == "cuda":
         print(f"  CUDA opt:   cudnn_benchmark={torch.backends.cudnn.benchmark}, tf32={torch.backends.cudnn.allow_tf32 and torch.backends.cuda.matmul.allow_tf32}")
-    print(f"  Parameters: {total:,} total, {trainable:,} trainable")
+    print("  Architecture:")
+    for line in str(summary(model, depth=3, verbose=0)).splitlines():
+        print(f"    {line}")
     print(f"  Optimize:   {optimization['name']} (lr={optimization['learning_rate']:.3g}, weight_decay={optimization['weight_decay']:.3g})")
     scheduler_description = scheduler['name']
     if scheduler['name'] != 'none':
@@ -390,6 +403,30 @@ def _write_sample(run: ExperimentRun, *, epoch: int | None, model: Any, tokenize
     return text
 
 
+def _loose_resume_config(args: argparse.Namespace, config: dict[str, Any], *, numeric: bool) -> tuple[dict[str, Any], bool]:
+    """Apply loose runtime overrides while retaining immutable model and data identity."""
+    requested = (
+        _numeric_config(
+            args,
+            config["dataset"],
+            {
+                "features": [None] * int(cast(Mapping[str, Any], config["model"]["parameters"])["feature_count"]),
+                "targets": [None] * int(cast(Mapping[str, Any], config["model"]["parameters"])["target_count"]),
+                "horizons": [None] * int(cast(Mapping[str, Any], config["model"]["parameters"])["horizon_count"]),
+            },
+            config["model"],
+        )
+        if numeric
+        else _resolved_config(args, config["dataset"], config["model"], str(config["generation"]["prompt"]))
+    )
+    updated = dict(config)
+    for section in ("loader", "optimization", "scheduler", "training"):
+        updated[section] = requested[section]
+    updated["training"] = {**cast(Mapping[str, Any], updated["training"]), "resume_mode": "loose"}
+    optimizer_changed = updated["optimization"] != config["optimization"] or updated["scheduler"] != config["scheduler"]
+    return updated, optimizer_changed
+
+
 def _numeric_resume_config(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
     """Reject explicit numeric resume overrides; saved config remains authoritative."""
     provided = getattr(args, "_provided", set())
@@ -397,6 +434,7 @@ def _numeric_resume_config(args: argparse.Namespace, config: dict[str, Any]) -> 
         raise ValueError("--model-profile cannot be used when resuming; the run's saved model config is authoritative.")
     options = {
         "experiment": {"seed", "deterministic"},
+        "training": {"compile"},
         "model": {"model_profile"},
         "loader": {"batch_size", "num_workers", "train_workers", "val_workers", "prefetch_factor"},
         "optimization": {"optimizer", "learning_rate", "weight_decay", "momentum"},
@@ -425,7 +463,7 @@ def _numeric_config(args: argparse.Namespace, manifest: Mapping[str, Any], runti
         "model": dict(model),
         "task": {"name": manifest.get("task"), "loss": "normalized_mse", "metrics": ["mae", "rmse"]},
         **resolved.to_mapping(),
-        "training": {"epochs": args.epochs, "device": args.device, "gradient_clip_norm": args.gradient_clip_norm},
+        "training": {"epochs": args.epochs, "device": args.device, "gradient_clip_norm": args.gradient_clip_norm, "compile": args.compile},
         "checkpointing": {"monitor": "validation/loss", "mode": "min", "save_frequency": args.checkpoint_frequency},
     }
 
@@ -448,13 +486,18 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
     config_loader.update({"num_workers": max(settings.train_workers, settings.validation_workers), "train_workers": settings.train_workers, "validation_workers": settings.validation_workers, "pin_memory": settings.pin_memory, "prefetch_factor": settings.prefetch_factor, "persistent_workers": settings.persistent_workers})
     cast(dict[str, Any], config["training"])["device"] = str(device)
     data = build_data_provenance(manifest=manifest, dataset_lock=dataset_lock, tokenizer_lock=None, normalizer_lock=normalizer_lock, runtime_metadata=data_module.runtime_metadata, dataset_root=args.dataset_root)
+    reset_optimizer_state = False
     if args.resume is None:
         run = ExperimentRun.create(args.runs_dir, name=args.name, config=config, data=data, environment=collect_environment(device=str(device), repository=Path(__file__).parent))
     else:
         run = ExperimentRun(args.resume)
         if not run.path.is_dir():
             raise ValueError(f"resume run directory does not exist: {run.path}")
-        config = _numeric_resume_config(args, _load_run_config(run))
+        saved_config = _load_run_config(run)
+        if args.resume_loose:
+            config, reset_optimizer_state = _loose_resume_config(args, saved_config, numeric=True)
+        else:
+            config, reset_optimizer_state = _numeric_resume_config(args, saved_config), False
         stored_data = _load_mapping_json(run.path / "data.json", "resume data")
         if stored_data.get("locking", {}).get("dataset_fingerprint") != data["locking"]["dataset_fingerprint"]:
             raise ValueError("resume dataset fingerprint is incompatible with the existing run")
@@ -468,6 +511,8 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
     model_config = cast(Mapping[str, Any], config["model"])
     resolved_training = resolve_training_config({"optimization": config["optimization"], "scheduler": config["scheduler"]})
     model = create_model_from_config(model_config)
+    if bool(cast(Mapping[str, Any], config["training"]).get("compile", False)):
+        model = compile_model(model)
     optimizer = create_optimizer(model.parameters(), resolved_training.optimization)
     scheduler = create_scheduler(optimizer, resolved_training.scheduler)
     provenance = {"run_id": run.run_id, "config_fingerprint": _fingerprint(config), "dataset_fingerprint": data["locking"]["dataset_fingerprint"], "tokenizer_fingerprint": None, "normalizer_fingerprint": data["normalizer"]["fingerprint"], "model_family": model_config["family"], "model_name": model_config["name"]}
@@ -491,7 +536,13 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
         resumed_epoch: int | None = None
         resumed_step: int | None = None
         if args.resume is not None:
-            _restore_experiment_checkpoint(trainer, run.path / "checkpoints" / "latest.pt", run=run, provenance=provenance)
+            _restore_experiment_checkpoint(
+                trainer,
+                run.path / "checkpoints" / "latest.pt",
+                run=run,
+                provenance=provenance,
+                restore_optimizer_state=not reset_optimizer_state,
+            )
             resumed_epoch, resumed_step = trainer.epoch, trainer.global_step
         _print_run_header(run=run, config=config, data=data, model=model, resume=args.resume is not None, resumed_epoch=resumed_epoch, resumed_step=resumed_step)
         result = trainer.fit(data_module.train_dataloader(), val_loader=data_module.val_dataloader(), epochs=args.epochs)
@@ -554,13 +605,18 @@ def _train(args: argparse.Namespace) -> int:
     cast(dict[str, Any], config["training"])["device"] = str(device)
     data = build_data_provenance(manifest=manifest, dataset_lock=dataset_lock, tokenizer_lock=tokenizer_lock, runtime_metadata=data_module.runtime_metadata, dataset_root=args.dataset_root)
 
+    reset_optimizer_state = False
     if args.resume is None:
         run = ExperimentRun.create(args.runs_dir, name=args.name, config=config, data=data, environment=collect_environment(device=str(device), repository=Path(__file__).parent))
     else:
         run = ExperimentRun(args.resume)
         if not run.path.is_dir():
             raise ValueError(f"resume run directory does not exist: {run.path}")
-        config = _resume_config(args, _load_run_config(run))
+        saved_config = _load_run_config(run)
+        if args.resume_loose:
+            config, reset_optimizer_state = _loose_resume_config(args, saved_config, numeric=False)
+        else:
+            config = _resume_config(args, saved_config)
         stored_data = json.loads((run.path / "data.json").read_text(encoding="utf-8"))
         if not isinstance(stored_data, Mapping) or stored_data.get("locking", {}).get("dataset_fingerprint") != data["locking"]["dataset_fingerprint"]:
             raise ValueError("resume dataset fingerprint is incompatible with the existing run")
@@ -575,6 +631,8 @@ def _train(args: argparse.Namespace) -> int:
     scheduler_config = cast(Mapping[str, Any], config["scheduler"])
     resolved_training = resolve_training_config({"optimization": optimizer_config, "scheduler": scheduler_config})
     model = create_model_from_config(model_config)
+    if bool(cast(Mapping[str, Any], config["training"]).get("compile", False)):
+        model = compile_model(model)
     optimizer = create_optimizer(model.parameters(), resolved_training.optimization)
     scheduler = create_scheduler(optimizer, resolved_training.scheduler)
     provenance = {"run_id": run.run_id, "config_fingerprint": _fingerprint(config), "dataset_fingerprint": data["locking"]["dataset_fingerprint"], "tokenizer_fingerprint": data.get("tokenizer", {}).get("fingerprint"), "normalizer_fingerprint": None, "model_family": model_config["family"], "model_name": model_config["name"]}
@@ -618,7 +676,13 @@ def _train(args: argparse.Namespace) -> int:
         resumed_epoch: int | None = None
         resumed_step: int | None = None
         if args.resume is not None:
-            _restore_experiment_checkpoint(trainer, run.path / "checkpoints" / "latest.pt", run=run, provenance=provenance)
+            _restore_experiment_checkpoint(
+                trainer,
+                run.path / "checkpoints" / "latest.pt",
+                run=run,
+                provenance=provenance,
+                restore_optimizer_state=not reset_optimizer_state,
+            )
             resumed_epoch, resumed_step = trainer.epoch, trainer.global_step
         _print_run_header(run=run, config=config, data=data, model=model, resume=args.resume is not None, resumed_epoch=resumed_epoch, resumed_step=resumed_step)
         result = trainer.fit(data_module.train_dataloader(), val_loader=data_module.val_dataloader(), epochs=args.epochs)

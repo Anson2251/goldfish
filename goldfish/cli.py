@@ -7,6 +7,7 @@ from collections.abc import Callable, Sequence
 
 import forecast
 import infer
+import info
 import prepare
 import train
 
@@ -17,6 +18,7 @@ _COMMANDS: dict[str, Command] = {
     "train": train.main,
     "infer": infer.main,
     "forecast": forecast.main,
+    "info": info.main,
 }
 
 
