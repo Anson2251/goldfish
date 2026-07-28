@@ -129,10 +129,10 @@ def test_train_creates_an_auditable_run_and_strictly_resumes(tmp_path: Path) -> 
     assert main(["train", str(dataset), "--resume", str(run), "--epochs", "1", "--max-new-tokens", "0"]) == 0
 
     metrics = [json.loads(line) for line in (run / "metrics.jsonl").read_text().splitlines()]
-    assert [record["epoch"] for record in metrics] == [0, 1]
+    assert [record["epoch"] for record in metrics] == [1, 2]
     summary = json.loads((run / "summary.json").read_text())
     assert summary["status"] == "completed"
-    assert summary["last_epoch"] == 1
+    assert summary["last_epoch"] == 2
 
 
 def test_train_rejects_legacy_corpus_arguments(tmp_path: Path) -> None:

@@ -15,11 +15,11 @@ class LanguageModelBatch:
     target_ids: Tensor
     attention_mask: Tensor
 
-    def to(self, device: torch.device) -> Self:
+    def to(self, device: torch.device, *, non_blocking: bool = False) -> Self:
         return type(self)(
-            input_ids=self.input_ids.to(device),
-            target_ids=self.target_ids.to(device),
-            attention_mask=self.attention_mask.to(device),
+            input_ids=self.input_ids.to(device, non_blocking=non_blocking),
+            target_ids=self.target_ids.to(device, non_blocking=non_blocking),
+            attention_mask=self.attention_mask.to(device, non_blocking=non_blocking),
         )
 
 
@@ -32,12 +32,12 @@ class PrefixLanguageModelBatch:
     attention_mask: Tensor
     loss_mask: Tensor
 
-    def to(self, device: torch.device) -> Self:
+    def to(self, device: torch.device, *, non_blocking: bool = False) -> Self:
         return type(self)(
-            input_ids=self.input_ids.to(device),
-            target_ids=self.target_ids.to(device),
-            attention_mask=self.attention_mask.to(device),
-            loss_mask=self.loss_mask.to(device),
+            input_ids=self.input_ids.to(device, non_blocking=non_blocking),
+            target_ids=self.target_ids.to(device, non_blocking=non_blocking),
+            attention_mask=self.attention_mask.to(device, non_blocking=non_blocking),
+            loss_mask=self.loss_mask.to(device, non_blocking=non_blocking),
         )
 
 

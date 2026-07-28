@@ -6,6 +6,8 @@ For the architecture and data contracts, see:
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - [`docs/DATASETS.md`](docs/DATASETS.md)
+- [`docs/TASKS.md`](docs/TASKS.md)
+- [`docs/MODELS.md`](docs/MODELS.md)
 - [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md)
 
 ## Quick start
@@ -82,12 +84,19 @@ data/<dataset-name>/
 
 `manifest.yaml` lists the exact split files and their order. The current text builder treats each listed file as one document and appends an EOS token between documents.
 
-`data/alphabet/` is the checked-in example dataset bundle, including its manifest, source splits, generated tokenizer, and lock artifacts. Other datasets under `data/` remain ignored by default unless explicitly unignored.
+`data/alphabet/` is the checked-in text example dataset bundle, including its manifest, source splits, generated tokenizer, and lock artifacts. `data/fourier/` is the checked-in numeric forecasting example: 28,000 deterministic observations from a 12-component, multi-frequency Fourier series, split across two ordered training shards, validation, and test, with frozen train-only normalization and lock artifacts. `data/fourier-lb256/` has identical raw rows and horizons but a `lookback` of 256, making it the paired long-history A/B dataset. Other datasets under `data/` remain ignored by default unless explicitly unignored.
 
 ### Prepare before training
 
 ```sh
+# Text language-model example
 uv run goldfish prepare data/alphabet
+
+# Numeric Fourier-series forecasting example
+uv run goldfish prepare data/fourier
+uv run goldfish train data/fourier --name fourier --epochs 10 --batch-size 32 --hidden-dim 32
+uv run goldfish forecast runs/exp1-fourier --checkpoint best --split test \
+  --plot runs/exp1-fourier/artifacts/forecasts/test-best.png
 ```
 
 Preparation performs:
@@ -112,12 +121,14 @@ uv run goldfish train <dataset-root> [options]
 
 ### Models
 
-Model choices are read from the language-model registry:
+Both language-model and numeric forecasting registries support:
 
 ```sh
 --model gru   # default
 --model lstm
 ```
+
+For numeric datasets, these select `forecast/gru` and `forecast/lstm` respectively.
 
 Common model options:
 
@@ -145,6 +156,43 @@ CUDA → MPS → CPU
 ```
 
 An explicit unavailable accelerator is an error: `--device cuda` does not silently fall back to CPU. The resolved device is recorded in the run configuration and environment metadata.
+
+### Startup brief and DataLoader resources
+
+Before the first training batch, Goldfish prints a run brief with the resolved device, dataset/window dimensions, model shape, DataLoader settings, optimizer/scheduler, reproducibility mode, and lock fingerprint. For example, numeric runs include:
+
+```text
+Device:     cuda
+Loader:     train_workers=9, val_workers=7, pin_memory=True, prefetch=2, persistent=True
+Reproduce:  deterministic=False, seed=None
+```
+
+`--num-workers auto` is the default. It reserves roughly 20% of logical CPUs for the operating system, then allocates the remaining worker budget 60:40 between training and validation/test. Training and validation execute sequentially, so this is a phase-specific limit rather than simultaneous CPU consumption.
+
+```sh
+# Default automatic allocation
+uv run goldfish train data/fourier-lb256 --num-workers auto
+
+# Explicit total budget or phase-specific overrides
+uv run goldfish train data/fourier-lb256 \
+  --num-workers 16 --train-workers 9 --val-workers 7 --prefetch-factor 4
+
+# Disable worker processes
+uv run goldfish train data/fourier-lb256 --num-workers 0
+```
+
+On CUDA, Goldfish enables pinned-memory DataLoaders and non-blocking batch transfer. For worker counts above zero, it also enables persistent workers and uses `--prefetch-factor` (default `2`). The resolved settings are saved in `config.yaml` and reused by strict resume. On successful completion, Goldfish also writes `artifacts/plots/training-curves.png`, with separate train and validation trajectories for every scalar metric in `metrics.jsonl`.
+
+### Reproducibility
+
+Deterministic execution is opt-in; it is **not** enabled by default because deterministic algorithms can reduce performance or reject unavailable kernels. Enable it only with an explicit seed:
+
+```sh
+uv run goldfish train data/fourier-lb256 \
+  --deterministic --seed 7
+```
+
+`--deterministic` without `--seed` is rejected. In deterministic mode, Goldfish seeds Python, NumPy, and PyTorch; enables deterministic PyTorch/cuDNN algorithms; and configures deterministic cuBLAS behavior before CUDA initialization. A seed may also be supplied without `--deterministic` when only repeatable random initialization is desired. The resolved `seed` and `deterministic` values are recorded in the run config and restored on resume.
 
 ### Optimizers
 
@@ -263,18 +311,35 @@ uv run python infer.py runs/exp1-alphabet-gru --checkpoint best --prompt "cdefg"
 
 `infer.py` loads the run's resolved model configuration and the selected managed checkpoint (`best`, `latest`, or `final`). It validates the current dataset and tokenizer locks before generation, so inference does not silently run with a changed vocabulary or dataset bundle.
 
+### Forecast visualization
+
+`goldfish forecast` can save a raw-unit matplotlib PNG for any exported forecast window:
+
+```sh
+uv run goldfish forecast <run-dir> --checkpoint best --split test \
+  --plot forecast.png --plot-window 0
+```
+
+Each target receives its own subplot. It shows the target’s model input history in blue, actual future values in green, and forecast values in dashed orange. The cutoff is row offset `0`; horizon positions follow the manifest-declared row offsets. Use `--plot-window` to choose a different exported window.
+
+### Lookback A/B datasets
+
+`data/fourier/` uses `lookback: 32`; `data/fourier-lb256/` uses `lookback: 256`. They contain byte-identical raw CSV rows, features, targets, and horizons, so they can isolate the effect of historical context. Both bundles have independently generated locks and normalizer artifacts. Recreate the long-history bundle with `uv run goldfish prepare data/fourier-lb256` after modifying its manifest or raw files.
+
 ## Commands, help, and tests
 
 | Dispatcher command | Direct entry point | Purpose |
 |---|---|---|
-| `goldfish prepare ...` | `prepare.py ...` | Build tokenizer and lock artifacts for a dataset. |
-| `goldfish train ...` | `train.py ...` | Create or resume a managed training run. |
+| `goldfish prepare ...` | `prepare.py ...` | Build text tokenizer or numeric normalizer and lock artifacts. |
+| `goldfish train ...` | `train.py ...` | Create or strictly resume a managed training run. |
 | `goldfish infer ...` | `infer.py ...` | Generate text from a managed checkpoint. |
+| `goldfish forecast ...` | `forecast.py ...` | Export and optionally plot numeric forecasts from a managed run. |
 
 ```sh
 uv run goldfish --help
 uv run python train.py --help
 uv run python infer.py --help
+uv run python forecast.py --help
 
 uv run pytest -q
 ```

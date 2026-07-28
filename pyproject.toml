@@ -14,6 +14,7 @@ dependencies = [
     "pytest>=9.1.1",
     "torch==2.6.0",
     "tqdm>=4.69.1",
+    "matplotlib>=3.11.1",
 ]
 
 [project.scripts]

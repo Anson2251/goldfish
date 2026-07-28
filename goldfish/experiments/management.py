@@ -107,7 +107,8 @@ class ExperimentRun:
             os.fsync(handle.fileno())
 
     def complete(self, *, last_epoch: int, global_step: int, best: Mapping[str, Any] | None = None, final: Mapping[str, Any] | None = None) -> None:
-        changes: dict[str, Any] = {"status": "completed", "finished_at": _utc_now(), "last_epoch": last_epoch, "global_step": global_step}
+        """Record completed lifecycle metadata with one-based user-facing epochs."""
+        changes: dict[str, Any] = {"status": "completed", "finished_at": _utc_now(), "last_epoch": last_epoch + 1, "global_step": global_step}
         if best is not None:
             changes["best"] = dict(best)
         if final is not None:
@@ -118,7 +119,7 @@ class ExperimentRun:
     def fail(self, error: BaseException, *, last_epoch: int | None = None, global_step: int | None = None) -> None:
         changes: dict[str, Any] = {"status": "failed", "finished_at": _utc_now(), "error": {"type": type(error).__name__, "message": str(error)}}
         if last_epoch is not None:
-            changes["last_epoch"] = last_epoch
+            changes["last_epoch"] = max(0, last_epoch + 1)
         if global_step is not None:
             changes["global_step"] = global_step
         self._update_summary(**changes)
@@ -151,6 +152,7 @@ def build_data_provenance(
     runtime_metadata: Mapping[str, Any],
     dataset_root: str | Path,
     manifest_path: str | Path | None = None,
+    normalizer_lock: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a provenance snapshot from already-validated lock and runtime mappings."""
     manifest, dataset_lock, runtime = (_mapping(manifest, "manifest"), _mapping(dataset_lock, "dataset_lock"), _mapping(runtime_metadata, "runtime_metadata"))
@@ -166,6 +168,10 @@ def build_data_provenance(
         tokenizer = _mapping(token_lock.get("tokenizer", {}), "tokenizer_lock.tokenizer")
         ids = _mapping(tokenizer.get("special_token_ids", {}), "tokenizer_lock.tokenizer.special_token_ids")
         result["tokenizer"] = {"artifact": tokenizer.get("path"), "lock": manifest.get("tokenizer", {}).get("lock") if isinstance(manifest.get("tokenizer"), Mapping) else None, "fingerprint": token_lock.get("fingerprint"), "artifact_sha256": tokenizer.get("sha256"), "name": tokenizer.get("name"), "vocab_size": tokenizer.get("vocab_size"), "pad_token_id": ids.get("pad"), "eos_token_id": ids.get("eos")}
+    if normalizer_lock is not None:
+        lock = _mapping(normalizer_lock, "normalizer_lock")
+        normalizer = _mapping(lock.get("normalizer", {}), "normalizer_lock.normalizer")
+        result["normalizer"] = {"artifact": normalizer.get("path"), "lock": manifest.get("normalization", {}).get("lock") if isinstance(manifest.get("normalization"), Mapping) else None, "fingerprint": lock.get("fingerprint"), "artifact_sha256": normalizer.get("sha256"), "name": normalizer.get("name"), "features": normalizer.get("features")}
     return result
 
 
@@ -245,7 +251,7 @@ class CheckpointManager:
     def best_summary(self) -> dict[str, Any] | None:
         if self.best_value is None or self.best_epoch is None:
             return None
-        return {"checkpoint": "checkpoints/best.pt", "epoch": self.best_epoch, "metric": self.monitor, "mode": self.mode, "value": self.best_value}
+        return {"checkpoint": "checkpoints/best.pt", "epoch": self.best_epoch + 1, "metric": self.monitor, "mode": self.mode, "value": self.best_value}
 
     def _payload(self, model: Any, optimizer: Any, scheduler: Any | None, scaler: Any | None, epoch: int, global_step: int, metrics: Mapping[str, Any]) -> dict[str, Any]:
         return {"format": CHECKPOINT_FORMAT, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict() if scheduler is not None else None, "amp_scaler": scaler.state_dict() if scaler is not None else None, "epoch": epoch, "global_step": global_step, "metrics": dict(metrics), "provenance": self.provenance}

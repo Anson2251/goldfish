@@ -15,5 +15,9 @@ wheels/
 !/data/alphabet/**
 !/data/repeat/
 !/data/repeat/**
+!/data/fourier/
+!/data/fourier/**
+!/data/fourier-lb256/
+!/data/fourier-lb256/**
 /artifacts
 /runs

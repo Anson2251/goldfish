@@ -80,6 +80,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     loader_config = _mapping(config, "loader")
     dataset_root = Path(cast(str, dataset_config["root"]))
     manifest = validator_registry.validate_manifest(dataset_root)
+    if manifest.get("builder") == "numeric_files_forecast":
+        raise ValueError("Numeric runs do not support text inference; use 'goldfish forecast' instead.")
     validate_dataset_lock(dataset_root, manifest)
     validate_tokenizer_lock(dataset_root, manifest)
     document_unit = manifest["format"]["document_unit"]

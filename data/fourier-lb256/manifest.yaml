@@ -1,0 +1,48 @@
+name: fourier-lb256
+version: "1.0"
+modality: numeric
+builder: numeric_files_forecast
+task: point_forecast
+
+format:
+  file_type: csv
+  delimiter: ","
+  timestamp_column: timestamp
+  entity_column: entity_id
+  sort_order: ascending
+
+schema:
+  features: [signal, trend, phase_sin, phase_cos]
+  targets: [signal]
+  dtypes:
+    timestamp: datetime
+    entity_id: string
+    signal: double
+    trend: double
+    phase_sin: double
+    phase_cos: double
+
+window:
+  lookback: 256
+  horizons: [1, 5, 20]
+
+normalization:
+  name: standard
+  fit_split: train
+  artifact: preprocessing/normalizer.json
+  lock: preprocessing/normalizer-lock.json
+
+splits:
+  train:
+    files:
+      - train/01-fourier.csv
+      - train/02-fourier.csv
+  val:
+    files:
+      - val/01-fourier.csv
+  test:
+    files:
+      - test/01-fourier.csv
+
+locking:
+  dataset_lock: dataset-lock.json

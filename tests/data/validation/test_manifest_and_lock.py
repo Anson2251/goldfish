@@ -13,11 +13,14 @@ from goldfish.data.validation import (
     ManifestValidationError,
     TokenizerLockValidationError,
     build_dataset_lock,
+    build_normalizer_lock,
     build_tokenizer_lock,
     validate_dataset_lock,
+    validate_normalizer_lock,
     validate_tokenizer_lock,
     validator_registry,
     write_dataset_lock,
+    write_normalizer_lock,
     write_tokenizer_lock,
 )
 
@@ -299,3 +302,124 @@ def test_tokenizer_lock_binds_the_current_dataset_train_fingerprint(tmp_path: Pa
 
     with pytest.raises(TokenizerLockValidationError, match="train fingerprint"):
         validate_tokenizer_lock(tmp_path, manifest)
+
+
+VALID_NUMERIC_MANIFEST = """\
+name: example-bars
+version: "1.0"
+modality: numeric
+builder: numeric_files_forecast
+task: point_forecast
+format:
+  file_type: csv
+  timestamp_column: timestamp
+  entity_column: entity_id
+  sort_order: ascending
+schema:
+  features: [open, close, volume]
+  targets: [close]
+  dtypes:
+    timestamp: datetime
+    entity_id: string
+    open: double
+    close: double
+    volume: int
+window:
+  lookback: 3
+  horizons: [1, 2]
+normalization:
+  name: standard
+  fit_split: train
+  artifact: preprocessing/normalizer.json
+  lock: preprocessing/normalizer-lock.json
+splits:
+  train:
+    files: [train/01-bars.csv]
+  val:
+    files: [val/01-bars.csv]
+  test:
+    files: [test/01-bars.csv]
+locking:
+  dataset_lock: dataset-lock.json
+"""
+
+
+def prepare_numeric_dataset(root: Path) -> Manifest:
+    for split in ("train", "val", "test", "preprocessing"):
+        (root / split).mkdir()
+    for split in ("train", "val", "test"):
+        (root / split / "01-bars.csv").write_text(
+            "timestamp,entity_id,open,close,volume\\n2024-01-01T00:00:00Z,a,1.5,2.5,3\\n",
+            encoding="utf-8",
+        )
+    return write_manifest(root, VALID_NUMERIC_MANIFEST)
+
+
+def write_normalizer_artifact(root: Path, manifest: Manifest) -> None:
+    (root / manifest["normalization"]["artifact"]).write_text(
+        json.dumps(
+            {
+                "format": "goldfish-normalizer-v1",
+                "name": "standard",
+                "features": ["open", "close", "volume"],
+                "means": [1.5, 2.5, 3.0],
+                "scales": [1.0, 1.0, 1.0],
+                "train_row_count": 1,
+                "source": {"train_fingerprint": "placeholder"},
+                "config": {"name": "standard", "fit_split": "train"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_validates_numeric_forecast_manifest_and_numeric_lock_semantics(tmp_path: Path) -> None:
+    manifest = prepare_numeric_dataset(tmp_path)
+    lock = write_dataset_lock(tmp_path, manifest)
+
+    lock_manifest = cast(dict[str, Any], lock["manifest"])
+    assert lock_manifest["schema"] == manifest["schema"]
+    assert lock_manifest["window"] == {"lookback": 3, "horizons": [1, 2]}
+    assert lock_manifest["normalization"] == manifest["normalization"]
+    assert validate_dataset_lock(tmp_path, manifest) == lock
+
+
+@pytest.mark.parametrize(
+    ("replacement", "match"),
+    [
+        ("  targets: [missing]", "target"),
+        ("  horizons: [1, 1]", "unique"),
+        ("  lookback: 0", "positive"),
+        ("  sort_order: descending", "sort_order"),
+        ("    volume: string", "double.*int"),
+    ],
+)
+def test_rejects_invalid_numeric_forecast_declarations(tmp_path: Path, replacement: str, match: str) -> None:
+    source, _, _ = replacement.partition(":")
+    manifest = VALID_NUMERIC_MANIFEST.replace(next(line for line in VALID_NUMERIC_MANIFEST.splitlines() if line.startswith(source)), replacement)
+
+    with pytest.raises(ManifestValidationError, match=match):
+        write_manifest(tmp_path, manifest)
+
+
+def test_normalizer_lock_binds_artifact_config_and_train_fingerprint(tmp_path: Path) -> None:
+
+    manifest = prepare_numeric_dataset(tmp_path)
+    dataset_lock = write_dataset_lock(tmp_path, manifest)
+    write_normalizer_artifact(tmp_path, manifest)
+
+    assert build_normalizer_lock(tmp_path, manifest) == write_normalizer_lock(tmp_path, manifest)
+    lock = validate_normalizer_lock(tmp_path, manifest)
+    assert lock["format"] == "goldfish-normalizer-lock-v1"
+    normalizer = cast(dict[str, Any], lock["normalizer"])
+    source = cast(dict[str, Any], lock["source"])
+    dataset_splits = cast(dict[str, Any], dataset_lock["splits"])
+    assert normalizer["features"] == ["open", "close", "volume"]
+    assert source["train_fingerprint"] == dataset_splits["train"]["fingerprint"]
+
+    artifact_path = tmp_path / "preprocessing" / "normalizer.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["means"] = [9.0, 2.5, 3.0]
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    with pytest.raises(ValueError, match="artifact.*sha256"):
+        validate_normalizer_lock(tmp_path, manifest)

@@ -40,12 +40,13 @@ def test_run_creation_writes_canonical_layout_and_never_overwrites(tmp_path: Pat
 def test_run_lifecycle_metrics_and_failure_summary(tmp_path: Path) -> None:
     run = ExperimentRun.create(tmp_path, name="trial", config={}, data={})
     run.start()
-    run.append_metrics({"epoch": 0, "global_step": 2, "train": {"loss": 1.0}})
+    run.append_metrics({"epoch": 1, "global_step": 2, "train": {"loss": 1.0}})
     run.complete(last_epoch=0, global_step=2, final={"checkpoint": "checkpoints/final.pt"})
 
     record = json.loads((run.path / "metrics.jsonl").read_text())
     summary = json.loads((run.path / "summary.json").read_text())
-    assert record["epoch"] == 0
+    assert record["epoch"] == 1
+    assert summary["last_epoch"] == 1
     assert summary["status"] == "completed"
     assert summary["finished_at"] is not None
 
@@ -106,6 +107,7 @@ def test_checkpoint_manager_saves_latest_best_final_and_periodic(tmp_path: Path)
         assert payload["optimizer"]
     assert manager.best_value == 1.0
     assert manager.best_epoch == 1
+    assert manager.best_summary()["epoch"] == 2
 
 
 def test_checkpoint_manager_rejects_missing_configured_monitor(tmp_path: Path) -> None:

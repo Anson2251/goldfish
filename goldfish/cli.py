@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Sequence
 
+import forecast
 import infer
 import prepare
 import train
@@ -15,6 +16,7 @@ _COMMANDS: dict[str, Command] = {
     "prepare": prepare.main,
     "train": train.main,
     "infer": infer.main,
+    "forecast": forecast.main,
 }
 
 

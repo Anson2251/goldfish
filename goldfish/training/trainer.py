@@ -113,7 +113,7 @@ class Trainer(Generic[BatchT]):
         metrics: list[dict[str, float]] = []
         progress = self._batches(loader, description=self._progress_description("train"), leave=True)
         for batch in progress:
-            batch = batch.to(self.device)
+            batch = batch.to(self.device, non_blocking=True) if self.device.type == "cuda" else batch.to(self.device)
             self.optimizer.zero_grad(set_to_none=True)
             output = self.model(batch)
             result = self.task.compute(output, batch)
@@ -133,10 +133,10 @@ class Trainer(Generic[BatchT]):
         """Run one validation epoch without gradient tracking."""
         self.model.eval()
         metrics: list[dict[str, float]] = []
-        progress = self._batches(loader, description=self._progress_description("val"), leave=False)
+        progress = self._batches(loader, description=self._progress_description("val"), leave=True)
         with torch.no_grad():
             for batch in progress:
-                batch = batch.to(self.device)
+                batch = batch.to(self.device, non_blocking=True) if self.device.type == "cuda" else batch.to(self.device)
                 output = self.model(batch)
                 result = self.task.compute(output, batch)
                 loss = self._total_loss(result.loss, output)
@@ -248,10 +248,10 @@ class Trainer(Generic[BatchT]):
     def _progress_metrics(self, batches: list[dict[str, float]], *, include_learning_rate: bool) -> dict[str, str]:
         """Return generic running means for tqdm without task-specific metric names."""
         means = self._mean_metrics(batches)
-        display = {name: f"{value:.4g}" for name, value in sorted(means.items())}
+        display = {name: f"{value:.4e}" for name, value in sorted(means.items())}
         if include_learning_rate:
             rates = self.learning_rates
-            display["lr"] = f"{rates[0]:.3g}" if len(rates) == 1 else ",".join(f"{rate:.3g}" for rate in rates)
+            display["lr"] = f"{rates[0]:.4e}" if len(rates) == 1 else ",".join(f"{rate:.4e}" for rate in rates)
         return display
 
     def _batches(self, loader: Iterable[BatchT], *, description: str, leave: bool) -> tqdm:

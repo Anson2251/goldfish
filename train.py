@@ -6,23 +6,28 @@ import argparse
 import hashlib
 import importlib
 import json
+import os
+import random
+import signal
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
+import numpy
 import torch
 import yaml
 
 from goldfish.config import create_optimizer, create_scheduler, resolve_training_config
+from goldfish.data.loading import resolve_loader_settings
 from goldfish.core import Task
 from goldfish.device import resolve_device
 from goldfish.experiments import CHECKPOINT_FORMAT, CheckpointManager, ExperimentRun, build_data_provenance, collect_environment
 from goldfish.generation import generate_text
 from goldfish.generation.text import TextTokenizer
 from goldfish.models import model_registry
-from goldfish.tasks import CausalLanguageModelTask, PrefixLanguageModelTask
+from goldfish.tasks import CausalLanguageModelTask, PointForecastTask, PrefixLanguageModelTask
 from goldfish.training import Trainer
 
 
@@ -86,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", type=Path, metavar="RUN_DIR", help="Strictly resume an existing run from latest.pt.")
     parser.add_argument("--sequence-length", type=int, default=64, help="Tokens in each training window (default: 64).")
     parser.add_argument("--batch-size", type=int, default=32, help="Training and validation batch size (default: 32).")
+    parser.add_argument("--num-workers", default="auto", help="Total DataLoader worker budget: 'auto' reserves 20%% CPU and splits the rest 60:40 (default: auto).")
+    parser.add_argument("--train-workers", type=int, help="Override training DataLoader workers.")
+    parser.add_argument("--val-workers", type=int, help="Override validation/test DataLoader workers.")
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="Batches prefetched per worker (default: 2).")
     parser.add_argument("--epochs", type=int, default=5, help="Epochs to train; on resume these are additional epochs (default: 5).")
     parser.add_argument("--embedding-dim", type=int, default=64, help="Character embedding width (default: 64).")
     parser.add_argument("--hidden-dim", type=int, default=128, help="Recurrent hidden width (default: 128).")
@@ -110,8 +119,39 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-path", "--output-path", type=Path, help="Optional legacy checkpoint destination.")
     parser.add_argument("--prompt", help="Generation prompt; defaults to the first training document.")
     parser.add_argument("--max-new-tokens", type=int, default=100, help="Maximum tokens to generate (default: 100).")
-    parser.add_argument("--seed", type=int, default=0, help="Torch random seed (default: 0).")
+    parser.add_argument("--seed", type=int, help="Optional random seed; required with --deterministic.")
+    parser.add_argument("--deterministic", action="store_true", help="Require deterministic PyTorch algorithms; requires --seed.")
     return parser
+
+
+def _configure_reproducibility(*, deterministic: bool, seed: int | None) -> None:
+    if deterministic and seed is None:
+        raise ValueError("--deterministic requires --seed.")
+    if seed is not None:
+        random.seed(seed)
+        numpy.random.seed(seed)
+        torch.manual_seed(seed)
+    if deterministic:
+        # Must be set before the first CUDA GEMM for deterministic cuBLAS execution.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(deterministic)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cudnn.benchmark = not deterministic
+        torch.backends.cudnn.allow_tf32 = not deterministic
+        torch.backends.cuda.matmul.allow_tf32 = not deterministic
+
+
+def _worker_budget(value: str) -> int | None:
+    if value == "auto":
+        return None
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise ValueError("num-workers must be 'auto' or a non-negative integer.") from error
+    if result < 0:
+        raise ValueError("num-workers must be non-negative.")
+    return result
 
 
 def _positive(value: int | float, name: str) -> None:
@@ -147,7 +187,7 @@ def _scheduler_overrides(args: argparse.Namespace) -> dict[str, Any]:
 def _resolved_config(args: argparse.Namespace, manifest: Mapping[str, Any], vocab_size: int, prompt: str) -> dict[str, Any]:
     resolved = resolve_training_config({"optimization": _optimization_overrides(args), "scheduler": _scheduler_overrides(args)})
     config = {
-        "experiment": {"name": args.name, "seed": args.seed},
+        "experiment": {"name": args.name, "seed": args.seed, "deterministic": args.deterministic},
         "dataset": {"root": str(args.dataset_root), "name": manifest.get("name"), "version": manifest.get("version"), "manifest": str(args.dataset_root / "manifest.yaml"), "builder": manifest.get("builder"), "document_unit": manifest.get("document_unit", manifest.get("format", {}).get("document_unit"))},
         "loader": {"sequence_length": args.sequence_length, "batch_size": args.batch_size, "num_workers": 0, "shuffle_train": True},
         "model": {"family": "language", "name": args.model, "vocab_size": vocab_size, "embedding_dim": args.embedding_dim, "hidden_dim": args.hidden_dim, "num_layers": args.num_layers, "dropout": args.dropout},
@@ -177,10 +217,24 @@ def _load_run_config(run: ExperimentRun) -> dict[str, Any]:
     return loaded
 
 
+def _load_mapping_json(path: Path, description: str) -> dict[str, Any]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise ValueError(f"{description} not found: {path}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid JSON in {description}: {path}") from error
+    if not isinstance(loaded, dict):
+        raise ValueError(f"{description} must be a mapping")
+    return loaded
+
+
+
 def _resume_config(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
     """Reject explicit immutable overrides; saved config remains the source of truth."""
     provided = getattr(args, "_provided", set())
     option_sections = {
+        "experiment": {"seed", "deterministic"},
         "model": {"model", "embedding_dim", "hidden_dim", "num_layers", "dropout"},
         "loader": {"sequence_length", "batch_size"},
         "optimization": {"optimizer", "learning_rate", "weight_decay", "momentum"},
@@ -200,7 +254,7 @@ def _restore_experiment_checkpoint(trainer: Trainer[Any], path: Path, *, run: Ex
     checkpoint_provenance = checkpoint.get("provenance")
     if not isinstance(checkpoint_provenance, Mapping):
         raise ValueError("resume checkpoint is missing provenance")
-    for key in ("run_id", "config_fingerprint", "dataset_fingerprint", "tokenizer_fingerprint", "model_family", "model_name"):
+    for key in ("run_id", "config_fingerprint", "dataset_fingerprint", "tokenizer_fingerprint", "normalizer_fingerprint", "model_family", "model_name"):
         if checkpoint_provenance.get(key) != provenance.get(key):
             raise ValueError(f"resume checkpoint provenance mismatch for {key}")
     trainer.model.load_state_dict(checkpoint["model"])
@@ -215,6 +269,54 @@ def _restore_experiment_checkpoint(trainer: Trainer[Any], path: Path, *, run: Ex
         trainer.scheduler.load_state_dict(scheduler_state)
     trainer.epoch = int(checkpoint["epoch"])
     trainer.global_step = int(checkpoint["global_step"])
+
+
+def _write_training_plot(run: ExperimentRun) -> Path:
+    """Render per-epoch train/validation metric trajectories for a completed run."""
+    records: list[Mapping[str, Any]] = []
+    for line in (run.path / "metrics.jsonl").read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        if isinstance(record, Mapping):
+            records.append(record)
+    metric_names = sorted({
+        name
+        for record in records
+        for phase in ("train", "validation")
+        if isinstance(record.get(phase), Mapping)
+        for name, value in cast(Mapping[str, Any], record[phase]).items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    })
+    if not records or not metric_names:
+        raise ValueError("Cannot plot training curves: metrics journal contains no scalar train/validation metrics.")
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from matplotlib import pyplot
+
+    figure, axes = pyplot.subplots(len(metric_names), 1, figsize=(10, 3.2 * len(metric_names)), sharex=True, squeeze=False)
+    epochs = [int(record["epoch"]) for record in records]
+    for index, metric in enumerate(metric_names):
+        axis = axes[index, 0]
+        for phase, color in (("train", "C0"), ("validation", "C1")):
+            points = [
+                (epoch, float(cast(Mapping[str, Any], record[phase])[metric]))
+                for epoch, record in zip(epochs, records, strict=True)
+                if isinstance(record.get(phase), Mapping) and isinstance(cast(Mapping[str, Any], record[phase]).get(metric), (int, float))
+            ]
+            if points:
+                axis.plot([epoch for epoch, _ in points], [value for _, value in points], color=color, label=phase)
+        axis.set_ylabel(metric)
+        axis.grid(True, alpha=0.25)
+        axis.legend(loc="best")
+    axes[-1, 0].set_xlabel("Epoch")
+    figure.suptitle(f"Training curves: {run.run_id}")
+    figure.tight_layout()
+    path = run.path / "artifacts" / "plots" / "training-curves.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    figure.savefig(path, dpi=150, bbox_inches="tight")
+    pyplot.close(figure)
+    return path
 
 
 def _format_metrics(metrics: Mapping[str, float] | None) -> str:
@@ -247,20 +349,21 @@ def _print_run_header(
     runtime = cast(Mapping[str, Any], data["runtime"])
     locking = cast(Mapping[str, Any], data["locking"])
     tokenizer = cast(Mapping[str, Any], data.get("tokenizer", {}))
+    experiment = cast(Mapping[str, Any], config["experiment"])
     total, trainable = _parameter_count(model)
     mode = "resuming" if resume else "new run"
     print(f"Goldfish — {mode}")
     print(f"  Run:        {run.path}")
     print(f"  Dataset:    {dataset['name']} v{dataset['version']} ({dataset['builder']})")
-    print(
-        f"  Data:       train={runtime.get('train_samples', '?')}, val={runtime.get('val_samples', '?')}, "
-        f"seq_len={loader['sequence_length']}, vocab={tokenizer.get('vocab_size', '?')}"
-    )
-    print(
-        f"  Model:      {model_config['family']}/{model_config['name']} "
-        f"(embedding={model_config['embedding_dim']}, hidden={model_config['hidden_dim']}, "
-        f"layers={model_config['num_layers']}, dropout={model_config['dropout']})"
-    )
+    data_shape = f"seq_len={loader['sequence_length']}, vocab={tokenizer.get('vocab_size', '?')}" if "sequence_length" in loader else f"lookback={runtime.get('lookback', '?')}, features={len(runtime.get('features', []))}, targets={len(runtime.get('targets', []))}"
+    model_shape = f"embedding={model_config['embedding_dim']}, " if "embedding_dim" in model_config else ""
+    print(f"  Device:     {config['training']['device']}")
+    print(f"  Data:       train={runtime.get('train_samples', '?')}, val={runtime.get('val_samples', '?')}, {data_shape}")
+    print(f"  Loader:     train_workers={loader.get('train_workers', loader.get('num_workers', 0))}, val_workers={loader.get('validation_workers', loader.get('num_workers', 0))}, pin_memory={loader.get('pin_memory', False)}, prefetch={loader.get('prefetch_factor')}, persistent={loader.get('persistent_workers', False)}")
+    print(f"  Model:      {model_config['family']}/{model_config['name']} ({model_shape}hidden={model_config['hidden_dim']}, layers={model_config['num_layers']}, dropout={model_config['dropout']})")
+    print(f"  Reproduce:  deterministic={experiment.get('deterministic', False)}, seed={experiment.get('seed')}")
+    if config["training"]["device"] == "cuda":
+        print(f"  CUDA opt:   cudnn_benchmark={torch.backends.cudnn.benchmark}, tf32={torch.backends.cudnn.allow_tf32 and torch.backends.cuda.matmul.allow_tf32}")
     print(f"  Parameters: {total:,} total, {trainable:,} trainable")
     print(f"  Optimize:   {optimization['name']} (lr={optimization['learning_rate']:.3g}, weight_decay={optimization['weight_decay']:.3g})")
     scheduler_description = scheduler['name']
@@ -287,7 +390,123 @@ def _write_sample(run: ExperimentRun, *, epoch: int | None, model: Any, tokenize
     return text
 
 
+def _numeric_resume_config(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
+    """Reject explicit numeric resume overrides; saved config remains authoritative."""
+    provided = getattr(args, "_provided", set())
+    options = {
+        "experiment": {"seed", "deterministic"},
+        "model": {"model", "hidden_dim", "num_layers", "dropout"},
+        "loader": {"batch_size", "num_workers", "train_workers", "val_workers", "prefetch_factor"},
+        "optimization": {"optimizer", "learning_rate", "weight_decay", "momentum"},
+        "scheduler": {"scheduler", "scheduler_step_timing", "scheduler_t_max", "scheduler_eta_min", "scheduler_step_size", "scheduler_gamma", "scheduler_factor", "scheduler_patience"},
+    }
+    runtime = {"features": [None] * int(config["model"]["feature_count"]), "targets": [None] * int(config["model"]["target_count"]), "horizons": [None] * int(config["model"]["horizon_count"])}
+    requested = _numeric_config(args, config["dataset"], runtime)
+    for section, section_options in options.items():
+        if provided.intersection(section_options) and requested[section] != config.get(section):
+            raise ValueError(f"resume {section} configuration is incompatible with the existing run")
+    return config
+
+
+def _numeric_config(args: argparse.Namespace, manifest: Mapping[str, Any], runtime: Mapping[str, Any]) -> dict[str, Any]:
+    resolved = resolve_training_config({"optimization": _optimization_overrides(args), "scheduler": _scheduler_overrides(args)})
+    features = runtime["features"]
+    targets = runtime["targets"]
+    horizons = runtime["horizons"]
+    if not isinstance(features, list) or not isinstance(targets, list) or not isinstance(horizons, list):
+        raise ValueError("numeric runtime metadata is missing feature, target, or horizon declarations")
+    return {
+        "experiment": {"name": args.name, "seed": args.seed, "deterministic": args.deterministic},
+        "dataset": {"root": str(args.dataset_root), "name": manifest.get("name"), "version": manifest.get("version"), "manifest": str(args.dataset_root / "manifest.yaml"), "builder": manifest.get("builder")},
+        "loader": {"batch_size": args.batch_size, "num_workers": 0, "train_workers": 0, "validation_workers": 0, "pin_memory": False, "prefetch_factor": None, "persistent_workers": False, "shuffle_train": True},
+        "model": {"family": "forecast", "name": args.model, "feature_count": len(features), "target_count": len(targets), "horizon_count": len(horizons), "hidden_dim": args.hidden_dim, "num_layers": args.num_layers, "dropout": args.dropout},
+        "task": {"name": manifest.get("task"), "loss": "normalized_mse", "metrics": ["mae", "rmse"]},
+        **resolved.to_mapping(),
+        "training": {"epochs": args.epochs, "device": args.device, "gradient_clip_norm": args.gradient_clip_norm},
+        "checkpointing": {"monitor": "validation/loss", "mode": "min", "save_frequency": args.checkpoint_frequency},
+    }
+
+
+def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device: torch.device, dataset_lock: Mapping[str, Any]) -> int:
+    validate_normalizer_lock = _future_api("goldfish.data.validation", "validate_normalizer_lock")
+    data_module_class = _future_api("goldfish.data.numeric", "NumericFilesForecastDataModule")
+    normalizer_lock = validate_normalizer_lock(args.dataset_root, manifest)
+    data_module = data_module_class(args.dataset_root, manifest, batch_size=args.batch_size)
+    settings = resolve_loader_settings(device=device, num_workers=_worker_budget(args.num_workers), train_workers=args.train_workers, validation_workers=args.val_workers, prefetch_factor=args.prefetch_factor)
+    data_module.configure_loading(train_workers=settings.train_workers, validation_workers=settings.validation_workers, pin_memory=settings.pin_memory, prefetch_factor=settings.prefetch_factor, persistent_workers=settings.persistent_workers)
+    config = _numeric_config(args, manifest, data_module.runtime_metadata)
+    config_loader = cast(dict[str, Any], config["loader"])
+    config_loader.update({"num_workers": max(settings.train_workers, settings.validation_workers), "train_workers": settings.train_workers, "validation_workers": settings.validation_workers, "pin_memory": settings.pin_memory, "prefetch_factor": settings.prefetch_factor, "persistent_workers": settings.persistent_workers})
+    cast(dict[str, Any], config["training"])["device"] = str(device)
+    data = build_data_provenance(manifest=manifest, dataset_lock=dataset_lock, tokenizer_lock=None, normalizer_lock=normalizer_lock, runtime_metadata=data_module.runtime_metadata, dataset_root=args.dataset_root)
+    if args.resume is None:
+        run = ExperimentRun.create(args.runs_dir, name=args.name, config=config, data=data, environment=collect_environment(device=str(device), repository=Path(__file__).parent))
+    else:
+        run = ExperimentRun(args.resume)
+        if not run.path.is_dir():
+            raise ValueError(f"resume run directory does not exist: {run.path}")
+        config = _numeric_resume_config(args, _load_run_config(run))
+        stored_data = _load_mapping_json(run.path / "data.json", "resume data")
+        if stored_data.get("locking", {}).get("dataset_fingerprint") != data["locking"]["dataset_fingerprint"]:
+            raise ValueError("resume dataset fingerprint is incompatible with the existing run")
+        if stored_data.get("normalizer", {}).get("fingerprint") != data.get("normalizer", {}).get("fingerprint"):
+            raise ValueError("resume normalizer fingerprint is incompatible with the existing run")
+        loader = cast(Mapping[str, Any], config["loader"])
+        data_module = data_module_class(args.dataset_root, manifest, batch_size=int(loader["batch_size"]))
+        saved_train_workers = int(loader.get("train_workers", loader.get("num_workers", 0)))
+        saved_validation_workers = int(loader.get("validation_workers", loader.get("num_workers", 0)))
+        data_module.configure_loading(train_workers=saved_train_workers, validation_workers=saved_validation_workers, pin_memory=bool(loader.get("pin_memory", device.type == "cuda")), prefetch_factor=cast(int | None, loader.get("prefetch_factor")), persistent_workers=bool(loader.get("persistent_workers", saved_train_workers > 0 or saved_validation_workers > 0)))
+    model_config = cast(Mapping[str, Any], config["model"])
+    resolved_training = resolve_training_config({"optimization": config["optimization"], "scheduler": config["scheduler"]})
+    model = model_registry.create("forecast", str(model_config["name"]), feature_count=int(model_config["feature_count"]), target_count=int(model_config["target_count"]), horizon_count=int(model_config["horizon_count"]), hidden_dim=int(model_config["hidden_dim"]), num_layers=int(model_config["num_layers"]), dropout=float(model_config["dropout"]))
+    optimizer = create_optimizer(model.parameters(), resolved_training.optimization)
+    scheduler = create_scheduler(optimizer, resolved_training.scheduler)
+    provenance = {"run_id": run.run_id, "config_fingerprint": _fingerprint(config), "dataset_fingerprint": data["locking"]["dataset_fingerprint"], "tokenizer_fingerprint": None, "normalizer_fingerprint": data["normalizer"]["fingerprint"], "model_family": model_config["family"], "model_name": model_config["name"]}
+    checkpoints = CheckpointManager(run.path, monitor="validation/loss", mode="min", save_frequency=cast(Mapping[str, Any], config["checkpointing"])["save_frequency"], provenance=provenance)
+    summary_path = run.path / "summary.json"
+    summary = _load_mapping_json(summary_path, "run summary")
+    if isinstance(summary.get("best"), Mapping):
+        checkpoints.best_value = summary["best"].get("value")
+        best_epoch = summary["best"].get("epoch")
+        checkpoints.best_epoch = int(best_epoch) - 1 if isinstance(best_epoch, int) else None
+    started = time.monotonic()
+
+    def on_epoch_end(result: Any) -> None:
+        metrics = {"train": result.train, "validation": result.validation}
+        run.append_metrics({"epoch": result.epoch + 1, "global_step": result.global_step, "wall_time_seconds": time.monotonic() - started, "learning_rate": result.learning_rates[0], **metrics})
+        checkpoints.on_epoch_end(model, optimizer, epoch=result.epoch, global_step=result.global_step, metrics=metrics, scheduler=scheduler)
+
+    trainer = Trainer(model, PointForecastTask(data_module.normalizer, data_module.runtime_metadata["targets"]), optimizer, scheduler=cast(Any, scheduler), scheduler_step_timing=resolved_training.scheduler.step_timing, scheduler_metric=getattr(resolved_training.scheduler, "monitor", None), device=device, gradient_clip_norm=cast(Mapping[str, Any], config["training"])["gradient_clip_norm"], on_epoch_end=on_epoch_end, progress=True)
+    run.start()
+    try:
+        resumed_epoch: int | None = None
+        resumed_step: int | None = None
+        if args.resume is not None:
+            _restore_experiment_checkpoint(trainer, run.path / "checkpoints" / "latest.pt", run=run, provenance=provenance)
+            resumed_epoch, resumed_step = trainer.epoch, trainer.global_step
+        _print_run_header(run=run, config=config, data=data, model=model, resume=args.resume is not None, resumed_epoch=resumed_epoch, resumed_step=resumed_step)
+        result = trainer.fit(data_module.train_dataloader(), val_loader=data_module.val_dataloader(), epochs=args.epochs)
+        final_metrics = {"train": result.history[-1].train, "validation": result.history[-1].validation}
+        final_path = checkpoints.save_final(model, optimizer, epoch=result.epoch, global_step=result.global_step, metrics=final_metrics, scheduler=scheduler)
+        run.complete(last_epoch=result.epoch, global_step=result.global_step, best=checkpoints.best_summary(), final={"checkpoint": str(final_path.relative_to(run.path)), "validation": result.history[-1].validation})
+        plot_path = _write_training_plot(run)
+        print(f"Training curves: {plot_path}")
+        print(f"Experiment run: {run.path}")
+        return 0
+    except BaseException as error:
+        run.fail(error, last_epoch=trainer.epoch, global_step=trainer.global_step)
+        raise
+
+
 def _train(args: argparse.Namespace) -> int:
+    if args.deterministic and args.seed is None:
+        raise ValueError("--deterministic requires --seed.")
+    if args.resume is None:
+        _configure_reproducibility(deterministic=args.deterministic, seed=args.seed)
+    else:
+        run_config = _load_run_config(ExperimentRun(args.resume))
+        experiment = cast(Mapping[str, Any], run_config["experiment"])
+        _configure_reproducibility(deterministic=bool(experiment.get("deterministic", False)), seed=cast(int | None, experiment.get("seed")))
     validate_dataset_lock = _future_api("goldfish.data.validation", "validate_dataset_lock")
     validate_tokenizer_lock = _future_api("goldfish.data.validation", "validate_tokenizer_lock")
     text_data = importlib.import_module("goldfish.data.text")
@@ -306,6 +525,8 @@ def _train(args: argparse.Namespace) -> int:
     device = resolve_device(args.device)
     manifest = _validate_manifest(args.dataset_root)
     dataset_lock = validate_dataset_lock(args.dataset_root, manifest)
+    if manifest.get("builder") == "numeric_files_forecast":
+        return _train_numeric(args, manifest, device, dataset_lock)
     tokenizer_lock = validate_tokenizer_lock(args.dataset_root, manifest)
     document_unit = manifest["format"]["document_unit"]
     if document_unit == "file-pair":
@@ -339,23 +560,23 @@ def _train(args: argparse.Namespace) -> int:
     optimizer_config = cast(Mapping[str, Any], config["optimization"])
     scheduler_config = cast(Mapping[str, Any], config["scheduler"])
     resolved_training = resolve_training_config({"optimization": optimizer_config, "scheduler": scheduler_config})
-    torch.manual_seed(int(cast(Mapping[str, Any], config["experiment"])["seed"]))
     model = model_registry.create("language", str(model_config["name"]), vocab_size=int(model_config["vocab_size"]), embedding_dim=int(model_config["embedding_dim"]), hidden_dim=int(model_config["hidden_dim"]), num_layers=int(model_config["num_layers"]), dropout=float(model_config["dropout"]))
     optimizer = create_optimizer(model.parameters(), resolved_training.optimization)
     scheduler = create_scheduler(optimizer, resolved_training.scheduler)
-    provenance = {"run_id": run.run_id, "config_fingerprint": _fingerprint(config), "dataset_fingerprint": data["locking"]["dataset_fingerprint"], "tokenizer_fingerprint": data.get("tokenizer", {}).get("fingerprint"), "model_family": model_config["family"], "model_name": model_config["name"]}
+    provenance = {"run_id": run.run_id, "config_fingerprint": _fingerprint(config), "dataset_fingerprint": data["locking"]["dataset_fingerprint"], "tokenizer_fingerprint": data.get("tokenizer", {}).get("fingerprint"), "normalizer_fingerprint": None, "model_family": model_config["family"], "model_name": model_config["name"]}
     checkpoints = CheckpointManager(run.path, monitor="validation/loss", mode="min", save_frequency=cast(Mapping[str, Any], config["checkpointing"])["save_frequency"], provenance=provenance)
     summary_path = run.path / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     if isinstance(summary.get("best"), Mapping):
         checkpoints.best_value = summary["best"].get("value")
-        checkpoints.best_epoch = summary["best"].get("epoch")
+        best_epoch = summary["best"].get("epoch")
+        checkpoints.best_epoch = int(best_epoch) - 1 if isinstance(best_epoch, int) else None
 
     epoch_total = int(cast(Mapping[str, Any], config["training"])["epochs"])
 
     def on_epoch_end(result: Any) -> None:
         metrics = {"train": result.train, "validation": result.validation}
-        run.append_metrics({"epoch": result.epoch, "global_step": result.global_step, "wall_time_seconds": time.monotonic() - started, "learning_rate": result.learning_rates[0] if len(result.learning_rates) == 1 else list(result.learning_rates), **metrics})
+        run.append_metrics({"epoch": result.epoch + 1, "global_step": result.global_step, "wall_time_seconds": time.monotonic() - started, "learning_rate": result.learning_rates[0] if len(result.learning_rates) == 1 else list(result.learning_rates), **metrics})
         is_best = checkpoints.on_epoch_end(model, optimizer, epoch=result.epoch, global_step=result.global_step, metrics=metrics, scheduler=scheduler)
         frequency = int(cast(Mapping[str, Any], config["generation"])["sample_frequency"])
         wrote_sample = (result.epoch + 1) % frequency == 0
@@ -393,6 +614,8 @@ def _train(args: argparse.Namespace) -> int:
         run.complete(last_epoch=result.epoch, global_step=result.global_step, best=checkpoints.best_summary(), final={"checkpoint": str(final_path.relative_to(run.path)), "validation": result.history[-1].validation})
         print("Validation metrics: " + ", ".join(f"{name}={value:.4f}" for name, value in sorted((result.history[-1].validation or {}).items())))
         print(f"Generated sample: {sample}")
+        plot_path = _write_training_plot(run)
+        print(f"Training curves: {plot_path}")
         if args.checkpoint_path is not None:
             trainer.save_checkpoint(args.checkpoint_path)
             print(f"Saved checkpoint: {args.checkpoint_path}")
@@ -401,6 +624,23 @@ def _train(args: argparse.Namespace) -> int:
     except BaseException as error:
         run.fail(error, last_epoch=trainer.epoch, global_step=trainer.global_step)
         raise
+
+
+class TrainingInterrupted(KeyboardInterrupt):
+    """Signal-triggered interruption that preserves the originating signal number."""
+
+    def __init__(self, signal_number: int) -> None:
+        super().__init__(f"training interrupted by signal {signal.Signals(signal_number).name}")
+        self.signal_number = signal_number
+
+
+def _install_signal_handlers() -> None:
+    """Translate termination signals into a catchable training interruption."""
+    def handler(signal_number: int, _frame: Any) -> None:
+        raise TrainingInterrupted(signal_number)
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
 
 
 def _provided_options(argv: Sequence[str]) -> set[str]:
@@ -416,7 +656,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     actual_argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(actual_argv)
     args._provided = _provided_options(actual_argv)
-    return _train(args)
+    _install_signal_handlers()
+    try:
+        return _train(args)
+    except TrainingInterrupted as error:
+        print(f"Training interrupted ({signal.Signals(error.signal_number).name}); run state was recorded.", file=sys.stderr)
+        return 128 + error.signal_number
 
 
 if __name__ == "__main__":

@@ -72,6 +72,7 @@ def test_dispatcher_forwards_train_arguments_unchanged(tmp_path: Path) -> None:
     ]) == 0
 
     assert (runs / "exp1-dispatch" / "checkpoints" / "final.pt").is_file()
+    assert (runs / "exp1-dispatch" / "artifacts" / "plots" / "training-curves.png").is_file()
 
 
 def test_train_entrypoint_accepts_train_arguments_without_subcommand(tmp_path: Path) -> None:
@@ -93,7 +94,7 @@ def test_infer_generates_from_a_managed_run(tmp_path: Path, capsys) -> None:
     assert main(["prepare", str(dataset)]) == 0
     assert train_main([
         str(dataset), "--runs-dir", str(runs), "--name", "infer", "--epochs", "1", "--sequence-length", "4",
-        "--batch-size", "2", "--embedding-dim", "4", "--hidden-dim", "4", "--max-new-tokens", "0",
+        "--batch-size", "2", "--embedding-dim", "4", "--hidden-dim", "4", "--max-new-tokens", "0", "--seed", "0",
     ]) == 0
 
     run = runs / "exp1-infer"

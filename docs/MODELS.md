@@ -1,0 +1,198 @@
+# Goldfish Model Specification
+
+This document specifies the model registry, recurrent components, and model compositions currently implemented in Goldfish. Models consume typed batches and return `ModelOutput`; objectives are defined separately in [`TASKS.md`](TASKS.md).
+
+## Shared output contract
+
+Every model returns:
+
+```python
+@dataclass
+class ModelOutput:
+    predictions: dict[str, Tensor]
+    representations: Tensor | None = None
+    aux_losses: dict[str, Tensor] = field(default_factory=dict)
+    diagnostics: dict[str, Tensor | float] = field(default_factory=dict)
+```
+
+`predictions` contains tensors required by a task. `representations` is optional contextual state for downstream inspection or extension. The current recurrent models do not emit auxiliary losses or diagnostics.
+
+## Registry
+
+**Implementation:** `goldfish.models.ModelRegistry`  
+**Shared instance:** `goldfish.models.model_registry`
+
+Models are registered under a `(family, name)` pair. Both values are normalized by trimming whitespace, lowercasing, and converting underscores to hyphens. Duplicate registration within a family is rejected. Lookup failure reports sorted available names in that family.
+
+Current registrations:
+
+| Family | Name | Factory |
+|---|---|---|
+| `language` | `gru` | `GRULanguageModel` |
+| `language` | `lstm` | `LSTMLanguageModel` |
+| `forecast` | `gru` | `GRUForecastModel` |
+| `forecast` | `lstm` | `LSTMForecastModel` |
+
+Create a configured model with:
+
+```python
+model = model_registry.create("language", "gru", **model_kwargs)
+```
+
+The training and inference entry points resolve the family from the dataset modality and use this registry rather than branching on individual model classes.
+
+## Recurrent backbones
+
+**Implementations:** `GRUBackbone`, `LSTMBackbone` in `goldfish.models.components.recurrent`
+
+Both wrappers instantiate PyTorch batch-first recurrent layers and validate that input embeddings are rank 3:
+
+```python
+embedded: Tensor  # [B, T, D]
+```
+
+Constructor parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `input_dim` | Input feature dimension `D` |
+| `hidden_dim` | Recurrent hidden dimension `H` |
+| `num_layers` | Stacked recurrent layers, default `1` |
+| `dropout` | PyTorch inter-layer recurrent dropout, default `0.0` |
+
+Forward results are:
+
+| Backbone | contextual states | final state |
+|---|---|---|
+| GRU | `[B, T, H]` | `[num_layers, B, H]` |
+| LSTM | `[B, T, H]` | `(hidden, cell)`, each `[num_layers, B, H]` |
+
+Both accept an optional compatible previous state. This enables incremental text generation without reprocessing the full generated prefix.
+
+## Language models
+
+**Implementations:** `GRULanguageModel`, `LSTMLanguageModel` in `goldfish.models.language.recurrent`
+
+### Constructor
+
+```python
+GRULanguageModel(
+    vocab_size: int,
+    embedding_dim: int,
+    hidden_dim: int,
+    *,
+    num_layers: int = 1,
+    dropout: float = 0.0,
+)
+```
+
+`LSTMLanguageModel` has the same signature. `vocab_size` must be positive. The model consists of:
+
+```text
+input token IDs -> Embedding(V, E) -> GRU/LSTM(E, H) -> Linear(H, V)
+```
+
+### Batch and output
+
+The normal forward path expects a structural token batch:
+
+```python
+input_ids: Tensor        # [B, T]
+attention_mask: Tensor   # [B, T]
+```
+
+`input_ids` must be rank 2 and `attention_mask` must have exactly the same shape. The model validates shape compatibility but does not use the mask to pack, zero, or reset recurrent states. The task applies masking to loss calculation.
+
+Forward output:
+
+```python
+ModelOutput(
+    predictions={"token_logits": logits},  # [B, T, V]
+    representations=states,                 # [B, T, H]
+)
+```
+
+### Incremental token API
+
+```python
+output, final_state = model.forward_tokens(input_ids, hidden_state=None)
+```
+
+`input_ids` must have shape `[B, T]` with `T > 0`. Passing the final state from one call to the next produces the same sequence logits as evaluating the concatenated token sequence in a single call, provided the same model state is used.
+
+`forward_tokens` does not take an attention mask and is the interface used by generation utilities.
+
+## Multi-horizon forecast models
+
+**Implementations:** `GRUForecastModel`, `LSTMForecastModel` in `goldfish.models.forecast.recurrent`
+
+### Constructor
+
+```python
+GRUForecastModel(
+    feature_count: int,
+    target_count: int,
+    horizon_count: int,
+    hidden_dim: int,
+    *,
+    num_layers: int = 1,
+    dropout: float = 0.0,
+)
+```
+
+`LSTMForecastModel` has the same signature. All dimensions must be positive, and `num_layers` must be positive.
+
+Architecture:
+
+```text
+normalized history [B, L, F]
+-> GRU/LSTM input size F, hidden size H
+-> final state at history position L - 1 [B, H]
+-> Linear(H, horizon_count * target_count)
+-> reshape [B, horizon_count, target_count]
+```
+
+The model uses `states[:, -1]`; it therefore requires a non-empty lookback dimension in practice. Inputs are fixed-length windows and are not packed or padded by the model.
+
+### Batch and output
+
+The forward path requires:
+
+```python
+inputs: Tensor  # [B, L, F]
+```
+
+`inputs` must be rank 3. The output is:
+
+```python
+ModelOutput(
+    predictions={"forecast": forecast},    # [B, H, C]
+    representations=states,                  # [B, L, hidden_dim]
+)
+```
+
+Here `H` equals `horizon_count` and `C` equals `target_count`. `PointForecastTask` requires this forecast tensor to match the normalized batch target tensor exactly.
+
+## Configuration mapping
+
+The CLI's common recurrent options map as follows:
+
+| CLI option | Language models | Forecast models |
+|---|---|---|
+| `--model gru` / `lstm` | Registry name in `language` family | Registry name in `forecast` family |
+| `--hidden-dim` | recurrent hidden size | recurrent hidden size |
+| `--num-layers` | recurrent layer count | recurrent layer count |
+| `--dropout` | recurrent inter-layer dropout | recurrent inter-layer dropout |
+| `--embedding-dim` | token embedding width | not used |
+
+For language models, `vocab_size` is taken from the prepared tokenizer. For forecast models, `feature_count`, `target_count`, and `horizon_count` come from the prepared numeric data metadata and manifest window definition.
+
+## Extension requirements
+
+A new model family or composition should:
+
+1. accept an explicit typed or structural batch rather than an unstructured tensor tuple;
+2. return `ModelOutput` with documented stable prediction keys;
+3. register under a non-colliding family/name pair if it is configurable;
+4. validate essential input ranks and configuration dimensions near the model boundary;
+5. leave loss calculation, raw-unit metrics, and decoding to the corresponding task or inference component.

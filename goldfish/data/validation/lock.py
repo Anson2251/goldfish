@@ -18,6 +18,7 @@ from .manifest import (
 
 LOCK_FORMAT_V1 = "goldfish-dataset-lock-v1"
 TOKENIZER_LOCK_FORMAT_V1 = "goldfish-tokenizer-lock-v1"
+NORMALIZER_LOCK_FORMAT_V1 = "goldfish-normalizer-lock-v1"
 _ALGORITHM = "sha256"
 
 
@@ -27,6 +28,10 @@ class DatasetLockValidationError(ValueError):
 
 class TokenizerLockValidationError(ValueError):
     """Raised when a tokenizer lock does not match its artifact or manifest."""
+
+
+class NormalizerLockValidationError(ValueError):
+    """Raised when a numeric normalizer lock does not match its artifact or manifest."""
 
 
 
@@ -61,17 +66,22 @@ def _split_fingerprint(split_name: str, files: list[dict[str, object]]) -> str:
     return sha256_bytes(canonical_json({"split": split_name, "files": files}))
 
 
-def _document_unit(manifest: Mapping[str, Any]) -> str:
+def _document_unit(manifest: Mapping[str, Any]) -> str | None:
     format_declaration = manifest.get("format")
-    if not isinstance(format_declaration, Mapping) or not isinstance(format_declaration.get("document_unit"), str):
+    if not isinstance(format_declaration, Mapping):
+        raise DatasetLockValidationError("Cannot build lock: manifest format must be declared.")
+    document_unit = format_declaration.get("document_unit")
+    if document_unit is None and manifest.get("builder") == "numeric_files_forecast":
+        return None
+    if not isinstance(document_unit, str):
         raise DatasetLockValidationError("Cannot build lock: manifest format.document_unit must be declared.")
-    return format_declaration["document_unit"]
+    return document_unit
 
 
 def _lock_manifest_semantics(manifest: Mapping[str, Any]) -> dict[str, object]:
     return {
         field: manifest[field]
-        for field in ("name", "version", "modality", "builder", "task", "format", "tokenizer")
+        for field in ("name", "version", "modality", "builder", "task", "format", "tokenizer", "schema", "window", "normalization")
         if field in manifest
     }
 
@@ -272,6 +282,94 @@ def validate_tokenizer_lock(root: Path | str, manifest: Manifest) -> dict[str, o
         raise TokenizerLockValidationError("Tokenizer lock configuration does not match manifest.yaml.")
     if loaded.get("fingerprint") != expected["fingerprint"]:
         raise TokenizerLockValidationError("Tokenizer lock fingerprint mismatch.")
+    return loaded
+
+
+def _normalizer_paths(root: Path, manifest: Mapping[str, Any]) -> tuple[Path, Path, Mapping[str, Any]]:
+    normalization = manifest.get("normalization")
+    if not isinstance(normalization, Mapping):
+        raise NormalizerLockValidationError("Numeric manifest is missing normalization declarations.")
+    try:
+        artifact_path = manifest_file_path(normalization["artifact"], "normalization.artifact")
+        lock_path = manifest_file_path(normalization["lock"], "normalization.lock")
+    except (KeyError, ManifestValidationError) as error:
+        raise NormalizerLockValidationError("Normalizer artifact and lock paths must be declared.") from error
+    return root / artifact_path, root / lock_path, normalization
+
+
+def _normalizer_metadata(root: Path, manifest: Mapping[str, Any]) -> tuple[dict[str, object], Path, Mapping[str, Any]]:
+    artifact_path, lock_path, config = _normalizer_paths(root, manifest)
+    try:
+        contents = artifact_path.read_bytes()
+        artifact = json.loads(contents)
+    except FileNotFoundError as error:
+        raise NormalizerLockValidationError(f"Normalizer artifact not found: {artifact_path}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise NormalizerLockValidationError(f"Invalid JSON in normalizer artifact {artifact_path}: {error}") from error
+    if not isinstance(artifact, Mapping):
+        raise NormalizerLockValidationError("Normalizer artifact must be a JSON object.")
+    features = artifact.get("features")
+    if not isinstance(features, list) or any(not isinstance(feature, str) for feature in features):
+        raise NormalizerLockValidationError("Normalizer artifact must declare ordered feature names.")
+    if artifact.get("name") != config.get("name"):
+        raise NormalizerLockValidationError("Normalizer artifact name does not match manifest.")
+    return (
+        {"path": str(artifact_path.relative_to(lock_path.parent)), "sha256": sha256_bytes(contents), "name": config.get("name"), "features": features},
+        lock_path,
+        config,
+    )
+
+
+def build_normalizer_lock(root: Path | str, manifest: Manifest) -> dict[str, object]:
+    """Build a normalizer lock bound to the current locked training split."""
+    root = Path(root)
+    dataset_lock = validate_dataset_lock(root, manifest)
+    normalizer, _, config = _normalizer_metadata(root, manifest)
+    splits = dataset_lock.get("splits")
+    train = splits.get("train") if isinstance(splits, Mapping) else None
+    train_fingerprint = train.get("fingerprint") if isinstance(train, Mapping) else None
+    if not isinstance(train_fingerprint, str):
+        raise NormalizerLockValidationError("Dataset lock does not contain a train fingerprint.")
+    schema = manifest.get("schema")
+    features = schema.get("features") if isinstance(schema, Mapping) else None
+    lock: dict[str, object] = {
+        "format": NORMALIZER_LOCK_FORMAT_V1,
+        "algorithm": _ALGORITHM,
+        "normalizer": normalizer,
+        "source": {"dataset_name": manifest.get("name"), "dataset_version": manifest.get("version"), "train_fingerprint": train_fingerprint},
+        "config": {"features": features, "normalization": {"name": config.get("name"), "fit_split": config.get("fit_split")}},
+    }
+    lock["fingerprint"] = sha256_bytes(canonical_json(lock))
+    return lock
+
+
+def write_normalizer_lock(root: Path | str, manifest: Manifest | None = None) -> dict[str, object]:
+    root = Path(root)
+    manifest = manifest if manifest is not None else validator_registry.validate_manifest(root)
+    lock = build_normalizer_lock(root, manifest)
+    _, lock_path, _ = _normalizer_metadata(root, manifest)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(json.dumps(lock, ensure_ascii=False, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    return lock
+
+
+def validate_normalizer_lock(root: Path | str, manifest: Manifest) -> dict[str, object]:
+    root = Path(root)
+    _, lock_path, _ = _normalizer_metadata(root, manifest)
+    try:
+        loaded = json.loads(lock_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise NormalizerLockValidationError(f"Normalizer lock not found: {lock_path}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise NormalizerLockValidationError(f"Invalid JSON in normalizer lock {lock_path}: {error}") from error
+    if not isinstance(loaded, dict) or loaded.get("format") != NORMALIZER_LOCK_FORMAT_V1 or loaded.get("algorithm") != _ALGORITHM:
+        raise NormalizerLockValidationError("Unsupported normalizer lock format or algorithm.")
+    expected = build_normalizer_lock(root, manifest)
+    if loaded.get("normalizer") != expected["normalizer"]:
+        raise NormalizerLockValidationError("Normalizer artifact sha256 or metadata does not match normalizer lock.")
+    for field in ("source", "config", "fingerprint"):
+        if loaded.get(field) != expected[field]:
+            raise NormalizerLockValidationError(f"Normalizer lock {field} does not match current dataset or manifest.")
     return loaded
 
 

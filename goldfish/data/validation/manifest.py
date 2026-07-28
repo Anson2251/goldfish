@@ -68,6 +68,10 @@ class ManifestValidatorV1:
         for field in self._required_fields:
             _require_nonempty_string(manifest.get(field), field)
 
+        if manifest["modality"] == "numeric":
+            self._validate_numeric_declarations(manifest)
+            return manifest
+
         format_declaration = _require_mapping(manifest.get("format"), "format")
         encoding = _require_nonempty_string(format_declaration.get("encoding"), "format.encoding")
         if encoding != "utf-8":
@@ -93,6 +97,77 @@ class ManifestValidatorV1:
         if manifest["modality"] == "text":
             self._validate_text_declarations(manifest, document_unit)
         return manifest
+
+    @staticmethod
+    def _validate_numeric_declarations(manifest: Manifest) -> None:
+        if manifest["builder"] != "numeric_files_forecast":
+            raise ManifestValidationError("numeric manifests require builder 'numeric_files_forecast'.")
+        if manifest["task"] != "point_forecast":
+            raise ManifestValidationError("numeric manifests require task 'point_forecast'.")
+        format_declaration = _require_mapping(manifest.get("format"), "format")
+        if format_declaration.get("file_type") != "csv":
+            raise ManifestValidationError("manifest format.file_type must be 'csv'.")
+        delimiter = format_declaration.get("delimiter", ",")
+        if not isinstance(delimiter, str) or len(delimiter) != 1:
+            raise ManifestValidationError("manifest format.delimiter must be a single character.")
+        timestamp = _require_nonempty_string(format_declaration.get("timestamp_column"), "format.timestamp_column")
+        entity = _require_nonempty_string(format_declaration.get("entity_column"), "format.entity_column")
+        if timestamp == entity:
+            raise ManifestValidationError("manifest timestamp_column and entity_column must be distinct.")
+        if format_declaration.get("sort_order") != "ascending":
+            raise ManifestValidationError("manifest format.sort_order must be 'ascending'.")
+
+        schema = _require_mapping(manifest.get("schema"), "schema")
+        features = ManifestValidatorV1._column_list(schema.get("features"), "schema.features")
+        targets = ManifestValidatorV1._column_list(schema.get("targets"), "schema.targets")
+        if not set(targets).issubset(features):
+            raise ManifestValidationError("manifest schema.targets must all be declared features.")
+        if timestamp in features or entity in features or timestamp in targets or entity in targets:
+            raise ManifestValidationError("manifest features and targets must not include timestamp or entity columns.")
+        dtypes = _require_mapping(schema.get("dtypes"), "schema.dtypes")
+        required_dtypes = {timestamp, entity, *features}
+        if set(dtypes) != required_dtypes:
+            raise ManifestValidationError("manifest schema.dtypes must declare exactly timestamp, entity, and feature columns.")
+        if dtypes.get(timestamp) != "datetime" or dtypes.get(entity) != "string":
+            raise ManifestValidationError("manifest timestamp/entity dtypes must be 'datetime' and 'string'.")
+        if any(dtypes.get(name) not in {"double", "int"} for name in features):
+            raise ManifestValidationError("manifest feature dtypes must be 'double' or 'int'.")
+
+        window = _require_mapping(manifest.get("window"), "window")
+        lookback = window.get("lookback")
+        if isinstance(lookback, bool) or not isinstance(lookback, int) or lookback <= 0:
+            raise ManifestValidationError("manifest window.lookback must be a positive integer.")
+        horizons = window.get("horizons")
+        if not isinstance(horizons, list) or not horizons or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in horizons):
+            raise ManifestValidationError("manifest window.horizons must be a non-empty list of positive integers.")
+        if len(set(horizons)) != len(horizons):
+            raise ManifestValidationError("manifest window.horizons must contain unique values.")
+
+        normalization = _require_mapping(manifest.get("normalization"), "normalization")
+        if normalization.get("name") != "standard" or normalization.get("fit_split") != "train":
+            raise ManifestValidationError("manifest normalization must set name 'standard' and fit_split 'train'.")
+        for field in ("artifact", "lock"):
+            manifest_file_path(_require_nonempty_string(normalization.get(field), f"normalization.{field}"), f"normalization.{field}")
+
+        splits = _require_mapping(manifest.get("splits"), "splits")
+        for split_name in ("train", "val", "test"):
+            split = _require_mapping(splits.get(split_name), f"splits.{split_name}")
+            files = split.get("files")
+            if not isinstance(files, list) or not files:
+                raise ManifestValidationError(f"manifest splits.{split_name}.files must be a non-empty list.")
+            for index, entry in enumerate(files):
+                manifest_file_path(entry, f"splits.{split_name}.files[{index}]")
+
+        locking = _require_mapping(manifest.get("locking"), "locking")
+        manifest_file_path(_require_nonempty_string(locking.get("dataset_lock"), "locking.dataset_lock"), "locking.dataset_lock")
+
+    @staticmethod
+    def _column_list(value: object, field: str) -> list[str]:
+        if not isinstance(value, list) or not value or any(not isinstance(item, str) or not item.strip() for item in value):
+            raise ManifestValidationError(f"manifest {field} must be a non-empty list of column names.")
+        if len(set(value)) != len(value):
+            raise ManifestValidationError(f"manifest {field} must contain distinct column names.")
+        return value
 
     @staticmethod
     def _validate_text_declarations(manifest: Manifest, document_unit: str) -> None:
