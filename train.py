@@ -19,14 +19,14 @@ import numpy
 import torch
 import yaml
 
-from goldfish.config import create_optimizer, create_scheduler, resolve_training_config
+from goldfish.config import create_model_from_config, create_optimizer, create_scheduler, load_model_profile, resolve_model_config, resolve_training_config
 from goldfish.data.loading import resolve_loader_settings
 from goldfish.core import Task
 from goldfish.device import resolve_device
 from goldfish.experiments import CHECKPOINT_FORMAT, CheckpointManager, ExperimentRun, build_data_provenance, collect_environment
 from goldfish.generation import generate_text
 from goldfish.generation.text import TextTokenizer
-from goldfish.models import model_registry
+
 from goldfish.tasks import CausalLanguageModelTask, PointForecastTask, PrefixLanguageModelTask
 from goldfish.training import Trainer
 
@@ -96,11 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-workers", type=int, help="Override validation/test DataLoader workers.")
     parser.add_argument("--prefetch-factor", type=int, default=2, help="Batches prefetched per worker (default: 2).")
     parser.add_argument("--epochs", type=int, default=5, help="Epochs to train; on resume these are additional epochs (default: 5).")
-    parser.add_argument("--embedding-dim", type=int, default=64, help="Character embedding width (default: 64).")
-    parser.add_argument("--hidden-dim", type=int, default=128, help="Recurrent hidden width (default: 128).")
-    parser.add_argument("--num-layers", type=int, default=1, help="Recurrent layer count (default: 1).")
-    parser.add_argument("--dropout", type=float, default=0.0, help="Recurrent dropout (default: 0).")
-    parser.add_argument("--model", choices=model_registry.names("language"), default="gru", help="Language-model architecture (default: gru).")
+    parser.add_argument("--model-profile", type=Path, help="YAML model architecture profile; required for new runs.")
     parser.add_argument("--learning-rate", "--lr", type=float, default=1e-3, help="Optimizer learning rate (default: 0.001).")
     parser.add_argument("--optimizer", choices=("adamw", "adam", "sgd"), default="adamw")
     parser.add_argument("--weight-decay", type=float, help="Optimizer weight decay (optimizer default when omitted).")
@@ -184,13 +180,13 @@ def _scheduler_overrides(args: argparse.Namespace) -> dict[str, Any]:
     return values
 
 
-def _resolved_config(args: argparse.Namespace, manifest: Mapping[str, Any], vocab_size: int, prompt: str) -> dict[str, Any]:
+def _resolved_config(args: argparse.Namespace, manifest: Mapping[str, Any], model: Mapping[str, Any], prompt: str) -> dict[str, Any]:
     resolved = resolve_training_config({"optimization": _optimization_overrides(args), "scheduler": _scheduler_overrides(args)})
     config = {
         "experiment": {"name": args.name, "seed": args.seed, "deterministic": args.deterministic},
         "dataset": {"root": str(args.dataset_root), "name": manifest.get("name"), "version": manifest.get("version"), "manifest": str(args.dataset_root / "manifest.yaml"), "builder": manifest.get("builder"), "document_unit": manifest.get("document_unit", manifest.get("format", {}).get("document_unit"))},
         "loader": {"sequence_length": args.sequence_length, "batch_size": args.batch_size, "num_workers": 0, "shuffle_train": True},
-        "model": {"family": "language", "name": args.model, "vocab_size": vocab_size, "embedding_dim": args.embedding_dim, "hidden_dim": args.hidden_dim, "num_layers": args.num_layers, "dropout": args.dropout},
+        "model": dict(model),
         "task": {"name": manifest.get("task")},
         **resolved.to_mapping(),
         "training": {"epochs": args.epochs, "device": args.device, "gradient_clip_norm": args.gradient_clip_norm},
@@ -233,14 +229,16 @@ def _load_mapping_json(path: Path, description: str) -> dict[str, Any]:
 def _resume_config(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
     """Reject explicit immutable overrides; saved config remains the source of truth."""
     provided = getattr(args, "_provided", set())
+    if "model_profile" in provided:
+        raise ValueError("--model-profile cannot be used when resuming; the run's saved model config is authoritative.")
     option_sections = {
         "experiment": {"seed", "deterministic"},
-        "model": {"model", "embedding_dim", "hidden_dim", "num_layers", "dropout"},
+        "model": {"model_profile"},
         "loader": {"sequence_length", "batch_size"},
         "optimization": {"optimizer", "learning_rate", "weight_decay", "momentum"},
         "scheduler": {"scheduler", "scheduler_step_timing", "scheduler_t_max", "scheduler_eta_min", "scheduler_step_size", "scheduler_gamma", "scheduler_factor", "scheduler_patience"},
     }
-    requested = _resolved_config(args, config["dataset"], int(config["model"]["vocab_size"]), str(config["generation"]["prompt"]))
+    requested = _resolved_config(args, config["dataset"], config["model"], str(config["generation"]["prompt"]))
     for section, options in option_sections.items():
         if provided.intersection(options) and requested[section] != config.get(section):
             raise ValueError(f"resume {section} configuration is incompatible with the existing run")
@@ -356,11 +354,13 @@ def _print_run_header(
     print(f"  Run:        {run.path}")
     print(f"  Dataset:    {dataset['name']} v{dataset['version']} ({dataset['builder']})")
     data_shape = f"seq_len={loader['sequence_length']}, vocab={tokenizer.get('vocab_size', '?')}" if "sequence_length" in loader else f"lookback={runtime.get('lookback', '?')}, features={len(runtime.get('features', []))}, targets={len(runtime.get('targets', []))}"
-    model_shape = f"embedding={model_config['embedding_dim']}, " if "embedding_dim" in model_config else ""
+    model_parameters = cast(Mapping[str, Any], model_config["parameters"])
+    model_shape = f"embedding={model_parameters['embedding_dim']}, " if "embedding_dim" in model_parameters else ""
     print(f"  Device:     {config['training']['device']}")
     print(f"  Data:       train={runtime.get('train_samples', '?')}, val={runtime.get('val_samples', '?')}, {data_shape}")
     print(f"  Loader:     train_workers={loader.get('train_workers', loader.get('num_workers', 0))}, val_workers={loader.get('validation_workers', loader.get('num_workers', 0))}, pin_memory={loader.get('pin_memory', False)}, prefetch={loader.get('prefetch_factor')}, persistent={loader.get('persistent_workers', False)}")
-    print(f"  Model:      {model_config['family']}/{model_config['name']} ({model_shape}hidden={model_config['hidden_dim']}, layers={model_config['num_layers']}, dropout={model_config['dropout']})")
+    details = ", ".join(f"{key}={value}" for key, value in model_parameters.items())
+    print(f"  Model:      {model_config['family']}/{model_config['name']} ({model_shape}{details})")
     print(f"  Reproduce:  deterministic={experiment.get('deterministic', False)}, seed={experiment.get('seed')}")
     if config["training"]["device"] == "cuda":
         print(f"  CUDA opt:   cudnn_benchmark={torch.backends.cudnn.benchmark}, tf32={torch.backends.cudnn.allow_tf32 and torch.backends.cuda.matmul.allow_tf32}")
@@ -393,22 +393,25 @@ def _write_sample(run: ExperimentRun, *, epoch: int | None, model: Any, tokenize
 def _numeric_resume_config(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
     """Reject explicit numeric resume overrides; saved config remains authoritative."""
     provided = getattr(args, "_provided", set())
+    if "model_profile" in provided:
+        raise ValueError("--model-profile cannot be used when resuming; the run's saved model config is authoritative.")
     options = {
         "experiment": {"seed", "deterministic"},
-        "model": {"model", "hidden_dim", "num_layers", "dropout"},
+        "model": {"model_profile"},
         "loader": {"batch_size", "num_workers", "train_workers", "val_workers", "prefetch_factor"},
         "optimization": {"optimizer", "learning_rate", "weight_decay", "momentum"},
         "scheduler": {"scheduler", "scheduler_step_timing", "scheduler_t_max", "scheduler_eta_min", "scheduler_step_size", "scheduler_gamma", "scheduler_factor", "scheduler_patience"},
     }
-    runtime = {"features": [None] * int(config["model"]["feature_count"]), "targets": [None] * int(config["model"]["target_count"]), "horizons": [None] * int(config["model"]["horizon_count"])}
-    requested = _numeric_config(args, config["dataset"], runtime)
+    model_parameters = cast(Mapping[str, Any], config["model"]["parameters"])
+    runtime = {"features": [None] * int(model_parameters["feature_count"]), "targets": [None] * int(model_parameters["target_count"]), "horizons": [None] * int(model_parameters["horizon_count"])}
+    requested = _numeric_config(args, config["dataset"], runtime, config["model"])
     for section, section_options in options.items():
         if provided.intersection(section_options) and requested[section] != config.get(section):
             raise ValueError(f"resume {section} configuration is incompatible with the existing run")
     return config
 
 
-def _numeric_config(args: argparse.Namespace, manifest: Mapping[str, Any], runtime: Mapping[str, Any]) -> dict[str, Any]:
+def _numeric_config(args: argparse.Namespace, manifest: Mapping[str, Any], runtime: Mapping[str, Any], model: Mapping[str, Any]) -> dict[str, Any]:
     resolved = resolve_training_config({"optimization": _optimization_overrides(args), "scheduler": _scheduler_overrides(args)})
     features = runtime["features"]
     targets = runtime["targets"]
@@ -419,7 +422,7 @@ def _numeric_config(args: argparse.Namespace, manifest: Mapping[str, Any], runti
         "experiment": {"name": args.name, "seed": args.seed, "deterministic": args.deterministic},
         "dataset": {"root": str(args.dataset_root), "name": manifest.get("name"), "version": manifest.get("version"), "manifest": str(args.dataset_root / "manifest.yaml"), "builder": manifest.get("builder")},
         "loader": {"batch_size": args.batch_size, "num_workers": 0, "train_workers": 0, "validation_workers": 0, "pin_memory": False, "prefetch_factor": None, "persistent_workers": False, "shuffle_train": True},
-        "model": {"family": "forecast", "name": args.model, "feature_count": len(features), "target_count": len(targets), "horizon_count": len(horizons), "hidden_dim": args.hidden_dim, "num_layers": args.num_layers, "dropout": args.dropout},
+        "model": dict(model),
         "task": {"name": manifest.get("task"), "loss": "normalized_mse", "metrics": ["mae", "rmse"]},
         **resolved.to_mapping(),
         "training": {"epochs": args.epochs, "device": args.device, "gradient_clip_norm": args.gradient_clip_norm},
@@ -434,7 +437,13 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
     data_module = data_module_class(args.dataset_root, manifest, batch_size=args.batch_size)
     settings = resolve_loader_settings(device=device, num_workers=_worker_budget(args.num_workers), train_workers=args.train_workers, validation_workers=args.val_workers, prefetch_factor=args.prefetch_factor)
     data_module.configure_loading(train_workers=settings.train_workers, validation_workers=settings.validation_workers, pin_memory=settings.pin_memory, prefetch_factor=settings.prefetch_factor, persistent_workers=settings.persistent_workers)
-    config = _numeric_config(args, manifest, data_module.runtime_metadata)
+    if args.resume is None:
+        if args.model_profile is None:
+            raise ValueError("--model-profile is required for a new run.")
+        model = resolve_model_config(load_model_profile(args.model_profile), family="forecast", runtime_parameters={"feature_count": len(data_module.runtime_metadata["features"]), "target_count": len(data_module.runtime_metadata["targets"]), "horizon_count": len(data_module.runtime_metadata["horizons"])})
+    else:
+        model = {}
+    config = _numeric_config(args, manifest, data_module.runtime_metadata, model)
     config_loader = cast(dict[str, Any], config["loader"])
     config_loader.update({"num_workers": max(settings.train_workers, settings.validation_workers), "train_workers": settings.train_workers, "validation_workers": settings.validation_workers, "pin_memory": settings.pin_memory, "prefetch_factor": settings.prefetch_factor, "persistent_workers": settings.persistent_workers})
     cast(dict[str, Any], config["training"])["device"] = str(device)
@@ -458,7 +467,7 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
         data_module.configure_loading(train_workers=saved_train_workers, validation_workers=saved_validation_workers, pin_memory=bool(loader.get("pin_memory", device.type == "cuda")), prefetch_factor=cast(int | None, loader.get("prefetch_factor")), persistent_workers=bool(loader.get("persistent_workers", saved_train_workers > 0 or saved_validation_workers > 0)))
     model_config = cast(Mapping[str, Any], config["model"])
     resolved_training = resolve_training_config({"optimization": config["optimization"], "scheduler": config["scheduler"]})
-    model = model_registry.create("forecast", str(model_config["name"]), feature_count=int(model_config["feature_count"]), target_count=int(model_config["target_count"]), horizon_count=int(model_config["horizon_count"]), hidden_dim=int(model_config["hidden_dim"]), num_layers=int(model_config["num_layers"]), dropout=float(model_config["dropout"]))
+    model = create_model_from_config(model_config)
     optimizer = create_optimizer(model.parameters(), resolved_training.optimization)
     scheduler = create_scheduler(optimizer, resolved_training.scheduler)
     provenance = {"run_id": run.run_id, "config_fingerprint": _fingerprint(config), "dataset_fingerprint": data["locking"]["dataset_fingerprint"], "tokenizer_fingerprint": None, "normalizer_fingerprint": data["normalizer"]["fingerprint"], "model_family": model_config["family"], "model_name": model_config["name"]}
@@ -511,14 +520,13 @@ def _train(args: argparse.Namespace) -> int:
     validate_tokenizer_lock = _future_api("goldfish.data.validation", "validate_tokenizer_lock")
     text_data = importlib.import_module("goldfish.data.text")
     data_module_class = _future_api("goldfish.data.text", "TextFilesLanguageModelDataModule")
-    for value, name in ((args.sequence_length, "sequence length"), (args.batch_size, "batch size"), (args.epochs, "epochs"), (args.embedding_dim, "embedding dimension"), (args.hidden_dim, "hidden dimension"), (args.learning_rate, "learning rate"), (args.num_layers, "num layers"), (args.sample_frequency, "sample frequency")):
+    for value, name in ((args.sequence_length, "sequence length"), (args.batch_size, "batch size"), (args.epochs, "epochs"), (args.learning_rate, "learning rate"), (args.sample_frequency, "sample frequency")):
         _positive(value, name)
     if args.gradient_clip_norm is not None:
         _positive(args.gradient_clip_norm, "gradient clip norm")
     if args.checkpoint_frequency is not None:
         _positive(args.checkpoint_frequency, "checkpoint frequency")
-    if args.dropout < 0:
-        raise ValueError("dropout must be non-negative.")
+
     if args.max_new_tokens < 0:
         raise ValueError("max new tokens must be non-negative.")
 
@@ -536,7 +544,13 @@ def _train(args: argparse.Namespace) -> int:
         task = CausalLanguageModelTask()
     data_module = data_module_class(args.dataset_root, manifest, sequence_length=args.sequence_length, batch_size=args.batch_size)
     prompt = args.prompt or _default_prompt(args.dataset_root, manifest)
-    config = _resolved_config(args, manifest, data_module.tokenizer.vocab_size, prompt)
+    if args.resume is None:
+        if args.model_profile is None:
+            raise ValueError("--model-profile is required for a new run.")
+        model = resolve_model_config(load_model_profile(args.model_profile), family="language", runtime_parameters={"vocab_size": data_module.tokenizer.vocab_size})
+    else:
+        model = {}
+    config = _resolved_config(args, manifest, model, prompt)
     cast(dict[str, Any], config["training"])["device"] = str(device)
     data = build_data_provenance(manifest=manifest, dataset_lock=dataset_lock, tokenizer_lock=tokenizer_lock, runtime_metadata=data_module.runtime_metadata, dataset_root=args.dataset_root)
 
@@ -560,7 +574,7 @@ def _train(args: argparse.Namespace) -> int:
     optimizer_config = cast(Mapping[str, Any], config["optimization"])
     scheduler_config = cast(Mapping[str, Any], config["scheduler"])
     resolved_training = resolve_training_config({"optimization": optimizer_config, "scheduler": scheduler_config})
-    model = model_registry.create("language", str(model_config["name"]), vocab_size=int(model_config["vocab_size"]), embedding_dim=int(model_config["embedding_dim"]), hidden_dim=int(model_config["hidden_dim"]), num_layers=int(model_config["num_layers"]), dropout=float(model_config["dropout"]))
+    model = create_model_from_config(model_config)
     optimizer = create_optimizer(model.parameters(), resolved_training.optimization)
     scheduler = create_scheduler(optimizer, resolved_training.scheduler)
     provenance = {"run_id": run.run_id, "config_fingerprint": _fingerprint(config), "dataset_fingerprint": data["locking"]["dataset_fingerprint"], "tokenizer_fingerprint": data.get("tokenizer", {}).get("fingerprint"), "normalizer_fingerprint": None, "model_family": model_config["family"], "model_name": model_config["name"]}

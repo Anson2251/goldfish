@@ -3,6 +3,7 @@ from pathlib import Path
 import sys
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
+LANGUAGE_PROFILE = _REPOSITORY_ROOT / "model-profiles" / "language" / "gru-small.yaml"
 sys.path.insert(0, str(_REPOSITORY_ROOT))
 
 
@@ -66,7 +67,7 @@ def test_file_pair_prefix_lm_prepare_train_and_infer(tmp_path: Path, capsys) -> 
     assert (dataset / "tokenizer" / "tokenizer.json").is_file()
     assert main([
         "train", str(dataset), "--runs-dir", str(runs), "--name", "pairs", "--epochs", "1",
-        "--sequence-length", "8", "--batch-size", "1", "--embedding-dim", "4", "--hidden-dim", "4",
+        "--sequence-length", "8", "--batch-size", "1", "--model-profile", str(LANGUAGE_PROFILE),
         "--max-new-tokens", "1",
     ]) == 0
 

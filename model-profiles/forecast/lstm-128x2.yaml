@@ -1,0 +1,8 @@
+schema_version: 1
+model:
+  family: forecast
+  name: lstm
+  parameters:
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.05

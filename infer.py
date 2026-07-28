@@ -16,7 +16,7 @@ from goldfish.data.validation import validate_dataset_lock, validate_tokenizer_l
 from goldfish.experiments import CHECKPOINT_FORMAT
 from goldfish.generation import generate_text
 from goldfish.generation.text import TextTokenizer
-from goldfish.models import model_registry
+from goldfish.config import create_model_from_config
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,16 +51,9 @@ def _mapping(config: Mapping[str, Any], key: str) -> Mapping[str, Any]:
 
 def _build_model(config: Mapping[str, Any], tokenizer: TextTokenizer) -> torch.nn.Module:
     model_config = _mapping(config, "model")
-    model = model_registry.create(
-        str(model_config["family"]),
-        str(model_config["name"]),
-        vocab_size=int(model_config["vocab_size"]),
-        embedding_dim=int(model_config["embedding_dim"]),
-        hidden_dim=int(model_config["hidden_dim"]),
-        num_layers=int(model_config["num_layers"]),
-        dropout=float(model_config["dropout"]),
-    )
-    if int(model_config["vocab_size"]) != tokenizer.vocab_size:
+    model = create_model_from_config(model_config)
+    parameters = _mapping(model_config, "parameters")
+    if int(parameters["vocab_size"]) != tokenizer.vocab_size:
         raise ValueError("Experiment model vocabulary size does not match the current dataset tokenizer.")
     return model
 

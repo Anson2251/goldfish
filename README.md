@@ -33,7 +33,7 @@ uv run goldfish train data/alphabet \
   --sequence-length 13 \
   --batch-size 32 \
   --epochs 40 \
-  --model gru \
+  --model-profile model-profiles/language/gru-small.yaml \
   --device cuda \
   --optimizer adamw \
   --weight-decay 0.0001 \
@@ -45,7 +45,8 @@ uv run goldfish train data/alphabet \
 The dispatcher forwards all arguments after `train` directly to `train.py`, so this is equivalent:
 
 ```sh
-uv run python train.py data/alphabet --name alphabet-gru --epochs 40
+uv run python train.py data/alphabet --name alphabet-gru --epochs 40 \
+  --model-profile model-profiles/language/gru-small.yaml
 ```
 
 The run is created under `runs/`, for example:
@@ -94,7 +95,8 @@ uv run goldfish prepare data/alphabet
 
 # Numeric Fourier-series forecasting example
 uv run goldfish prepare data/fourier
-uv run goldfish train data/fourier --name fourier --epochs 10 --batch-size 32 --hidden-dim 32
+uv run goldfish train data/fourier --name fourier --epochs 10 --batch-size 32 \
+  --model-profile model-profiles/forecast/gru-small.yaml
 uv run goldfish forecast runs/exp1-fourier --checkpoint best --split test \
   --plot runs/exp1-fourier/artifacts/forecasts/test-best.png
 ```
@@ -121,23 +123,15 @@ uv run goldfish train <dataset-root> [options]
 
 ### Models
 
-Both language-model and numeric forecasting registries support:
+Model architectures are selected with a required YAML profile:
 
 ```sh
---model gru   # default
---model lstm
+--model-profile model-profiles/language/gru-small.yaml
+--model-profile model-profiles/forecast/lstm-small.yaml
+--model-profile model-profiles/forecast/multihead-lstm-small.yaml
 ```
 
-For numeric datasets, these select `forecast/gru` and `forecast/lstm` respectively.
-
-Common model options:
-
-| Option | Default | Meaning |
-|---|---:|---|
-| `--embedding-dim` | `64` | Token embedding dimension. |
-| `--hidden-dim` | `128` | Recurrent hidden-state dimension. |
-| `--num-layers` | `1` | Number of GRU/LSTM layers. |
-| `--dropout` | `0.0` | Recurrent inter-layer dropout. |
+Profiles supply architecture-owned parameters and model registry identity. Goldfish injects data-derived dimensions (vocabulary size or numeric feature/target/horizon counts), then saves the complete resolved model configuration in the run. This keeps new model-specific hyperparameters out of the training CLI.
 
 ### Device selection
 

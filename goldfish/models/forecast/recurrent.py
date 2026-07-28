@@ -2,10 +2,11 @@
 
 from typing import Protocol
 
+import torch
 from torch import Tensor, nn
 
 from goldfish.core import ModelOutput
-from goldfish.models.components import GRUBackbone, LSTMBackbone
+from goldfish.models.components import DoublyStochasticMixer, GRUBackbone, LSTMBackbone
 
 
 class ForecastBatch(Protocol):
@@ -52,3 +53,58 @@ class LSTMForecastModel(_RecurrentForecastModel):
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
         self.backbone = LSTMBackbone(feature_count, hidden_dim, num_layers=num_layers, dropout=dropout)
+
+
+class MultiHeadLSTMForecastModel(nn.Module):
+    """Parallel LSTM heads fused by a doubly stochastic channel mixer."""
+
+    def __init__(
+        self,
+        feature_count: int,
+        target_count: int,
+        horizon_count: int,
+        hidden_dim: int,
+        *,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        sinkhorn_iterations: int = 20,
+    ) -> None:
+        super().__init__()
+        if min(feature_count, target_count, horizon_count, hidden_dim, num_heads, num_layers) <= 0:
+            raise ValueError("multi-head LSTM model dimensions must be positive")
+        if hidden_dim % num_heads != 0:
+            raise ValueError("hidden_dim must be divisible by num_heads")
+
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.input_projections = nn.ModuleList(nn.Linear(feature_count, self.head_dim) for _ in range(num_heads))
+        self.input_normalizations = nn.ModuleList(nn.LayerNorm(self.head_dim) for _ in range(num_heads))
+        self.heads = nn.ModuleList(
+            nn.LSTM(
+                input_size=self.head_dim,
+                hidden_size=self.head_dim,
+                num_layers=num_layers,
+                dropout=dropout,
+                batch_first=True,
+            )
+            for _ in range(num_heads)
+        )
+        self.mixer = DoublyStochasticMixer(num_heads, sinkhorn_iterations=sinkhorn_iterations)
+        self.fusion = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim))
+        self.forecast_head = nn.Linear(hidden_dim, horizon_count * target_count)
+        self.target_count = target_count
+        self.horizon_count = horizon_count
+
+    def forward(self, batch: ForecastBatch) -> ModelOutput:
+        if batch.inputs.ndim != 3:
+            raise ValueError("forecast inputs must have shape [batch, lookback, feature_count].")
+        head_states = [head(normalization(projection(batch.inputs)))[0] for projection, normalization, head in zip(self.input_projections, self.input_normalizations, self.heads, strict=True)]
+        stacked_states = torch.stack(head_states, dim=-2)
+        mixed_states = self.mixer(stacked_states)
+        representations = self.fusion(mixed_states.flatten(start_dim=-2))
+        forecast = self.forecast_head(representations[:, -1]).reshape(
+            batch.inputs.shape[0], self.horizon_count, self.target_count
+        )
+        return ModelOutput(predictions={"forecast": forecast}, representations=representations)

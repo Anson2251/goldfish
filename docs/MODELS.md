@@ -32,6 +32,7 @@ Current registrations:
 | `language` | `lstm` | `LSTMLanguageModel` |
 | `forecast` | `gru` | `GRUForecastModel` |
 | `forecast` | `lstm` | `LSTMForecastModel` |
+| `forecast` | `multihead-lstm` | `MultiHeadLSTMForecastModel` |
 
 Create a configured model with:
 
@@ -173,19 +174,49 @@ ModelOutput(
 
 Here `H` equals `horizon_count` and `C` equals `target_count`. `PointForecastTask` requires this forecast tensor to match the normalized batch target tensor exactly.
 
-## Configuration mapping
+## Doubly stochastic channel mixer
 
-The CLI's common recurrent options map as follows:
+**Implementation:** `DoublyStochasticMixer` in `goldfish.models.components.mixing`
 
-| CLI option | Language models | Forecast models |
-|---|---|---|
-| `--model gru` / `lstm` | Registry name in `language` family | Registry name in `forecast` family |
-| `--hidden-dim` | recurrent hidden size | recurrent hidden size |
-| `--num-layers` | recurrent layer count | recurrent layer count |
-| `--dropout` | recurrent inter-layer dropout | recurrent inter-layer dropout |
-| `--embedding-dim` | token embedding width | not used |
+`DoublyStochasticMixer` applies a learnable, static channel mixing matrix to an input shaped `[..., N, D]`:
 
-For language models, `vocab_size` is taken from the prepared tokenizer. For forecast models, `feature_count`, `target_count`, and `horizon_count` come from the prepared numeric data metadata and manifest window definition.
+```text
+mixed[output_channel] = sum(input_channel, mixing[output_channel, input_channel] * input[input_channel])
+```
+
+The parameter logits are projected in log space through iterative Sinkhorn normalization. The resulting `mixing` matrix is non-negative with rows and columns summing to one, so each output channel is a convex combination of all source channels and each source channel contributes a total weight of one. It is initialized near the identity matrix, which makes initial mixing minimal while preserving a learnable communication path between channels.
+
+## Multi-head LSTM forecast model
+
+**Implementation:** `MultiHeadLSTMForecastModel` in `goldfish.models.forecast.recurrent`
+
+The model runs `num_heads` independent LSTMs. Each head projects and LayerNorms the common numeric input, produces a `head_dim = hidden_dim / num_heads` state sequence, and then stacks the states as `[B, L, num_heads, head_dim]`. `DoublyStochasticMixer` mixes the head dimension before the mixed heads are concatenated and fused into `[B, L, hidden_dim]`. The final time position is projected to the standard `[B, horizon_count, target_count]` forecast.
+
+`hidden_dim` must be divisible by `num_heads`. The `multihead-lstm` registry model accepts `num_heads` (CLI: `--lstm-heads`, default `4`) and `sinkhorn_iterations` (CLI: `--sinkhorn-iterations`, default `20`). Do not mean-pool the mixer output over heads: double stochasticity preserves this mean exactly, making such a readout independent of the mixer.
+
+## Model profiles and configuration
+
+Architecture settings are stored in version-controlled YAML profiles under the repository-root `model-profiles/` directory, for example `model-profiles/forecast/multihead-lstm-small.yaml`. New training runs require `--model-profile`:
+```sh
+uv run goldfish train data/fourier \
+  --model-profile model-profiles/forecast/multihead-lstm-small.yaml
+```
+
+A profile identifies the registry model and supplies only architecture-owned parameters:
+
+```yaml
+model:
+  family: forecast
+  name: multihead-lstm
+  parameters:
+    hidden_dim: 32
+    num_heads: 4
+    num_layers: 1
+    dropout: 0.0
+    sinkhorn_iterations: 20
+```
+
+Goldfish injects dataset-derived dimensions into the resolved run configuration: `vocab_size` for language models, and `feature_count`, `target_count`, and `horizon_count` for forecast models. Profiles must not supply these fields. The fully resolved `model.parameters` mapping is saved to the run's `config.yaml`; training, resume, `infer`, and `forecast` construct models through that same mapping. A resumed run cannot take `--model-profile`, because its saved model configuration is authoritative.
 
 ## Extension requirements
 

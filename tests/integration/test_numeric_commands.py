@@ -9,6 +9,7 @@ import torch
 
 
 ROOT = Path(__file__).parents[2]
+FORECAST_PROFILE = ROOT / "model-profiles" / "forecast" / "gru-small.yaml"
 
 
 def load_entry(name: str):
@@ -75,7 +76,7 @@ def test_prepare_and_train_numeric_forecast_run(tmp_path: Path, capsys) -> None:
     assert load_entry("prepare")([str(dataset)]) == 0
     assert load_entry("train")([
         str(dataset), "--runs-dir", str(runs), "--name", "numeric", "--epochs", "1", "--batch-size", "2",
-        "--device", "cpu", "--num-workers", "0", "--hidden-dim", "4", "--max-new-tokens", "0", "--deterministic", "--seed", "7",
+        "--device", "cpu", "--num-workers", "0", "--model-profile", str(FORECAST_PROFILE), "--max-new-tokens", "0", "--deterministic", "--seed", "7",
     ]) == 0
 
     run = runs / "exp1-numeric"
@@ -102,7 +103,7 @@ def test_numeric_training_strictly_resumes_from_latest_checkpoint(tmp_path: Path
     write_numeric_bundle(dataset)
     assert load_entry("prepare")([str(dataset)]) == 0
     assert load_entry("train")([
-        str(dataset), "--runs-dir", str(runs), "--name", "resume", "--epochs", "1", "--batch-size", "2", "--num-workers", "0", "--hidden-dim", "4",
+        str(dataset), "--runs-dir", str(runs), "--name", "resume", "--epochs", "1", "--batch-size", "2", "--num-workers", "0", "--model-profile", str(FORECAST_PROFILE),
     ]) == 0
 
     run = runs / "exp1-resume"
@@ -118,15 +119,15 @@ def test_numeric_training_strictly_resumes_from_latest_checkpoint(tmp_path: Path
     assert checkpoint["global_step"] == 4
     assert len(records) == 2
 
-    with pytest.raises(ValueError, match="resume model configuration"):
-        load_entry("train")([str(dataset), "--resume", str(run), "--epochs", "1", "--hidden-dim", "8"])
+    with pytest.raises(ValueError, match="model-profile cannot be used when resuming"):
+        load_entry("train")([str(dataset), "--resume", str(run), "--epochs", "1", "--model-profile", str(ROOT / "model-profiles" / "forecast" / "lstm-small.yaml")])
 
 
 def test_forecast_exports_raw_unit_predictions_and_text_infer_rejects_numeric_run(tmp_path: Path) -> None:
     dataset, runs = tmp_path / "dataset", tmp_path / "runs"
     write_numeric_bundle(dataset)
     assert load_entry("prepare")([str(dataset)]) == 0
-    assert load_entry("train")([str(dataset), "--runs-dir", str(runs), "--name", "numeric", "--epochs", "1", "--batch-size", "2", "--num-workers", "0", "--hidden-dim", "4"]) == 0
+    assert load_entry("train")([str(dataset), "--runs-dir", str(runs), "--name", "numeric", "--epochs", "1", "--batch-size", "2", "--num-workers", "0", "--model-profile", str(FORECAST_PROFILE)]) == 0
 
     run = runs / "exp1-numeric"
     output = tmp_path / "predictions.jsonl"

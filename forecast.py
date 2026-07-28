@@ -15,7 +15,7 @@ from goldfish.data.numeric import NumericFilesForecastDataModule
 from goldfish.data.validation import validate_dataset_lock, validate_normalizer_lock, validator_registry
 from goldfish.device import resolve_device
 from goldfish.experiments import CHECKPOINT_FORMAT
-from goldfish.models import model_registry
+from goldfish.config import create_model_from_config
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -121,11 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     batch_size = args.batch_size or int(loader_config["batch_size"])
     data_module = NumericFilesForecastDataModule(dataset_root, manifest, batch_size=batch_size)
     loader = data_module.val_dataloader() if args.split == "val" else data_module.test_dataloader()
-    model = model_registry.create(
-        "forecast", str(model_config["name"]), feature_count=int(model_config["feature_count"]),
-        target_count=int(model_config["target_count"]), horizon_count=int(model_config["horizon_count"]),
-        hidden_dim=int(model_config["hidden_dim"]), num_layers=int(model_config["num_layers"]), dropout=float(model_config["dropout"]),
-    )
+    model = create_model_from_config(model_config)
     checkpoint_path = args.run_dir / "checkpoints" / f"{args.checkpoint}.pt"
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)

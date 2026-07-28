@@ -7,6 +7,7 @@ import pytest
 import torch
 
 _REPOSITORY_ROOT = Path(__file__).parents[2]
+LANGUAGE_PROFILE = _REPOSITORY_ROOT / "model-profiles" / "language" / "gru-small.yaml"
 sys.path.insert(0, str(_REPOSITORY_ROOT))
 _ENTRY_POINT = _REPOSITORY_ROOT / "main.py"
 _SPEC = importlib.util.spec_from_file_location("goldfish_main", _ENTRY_POINT)
@@ -93,7 +94,7 @@ def test_train_consumes_prepared_dataset_and_uses_a_nonempty_default_prompt(tmp_
     _write_dataset(tmp_path)
     assert main(["prepare", str(tmp_path)]) == 0
 
-    assert main(["train", str(tmp_path), "--sequence-length", "4", "--batch-size", "2", "--epochs", "1", "--max-new-tokens", "0"]) == 0
+    assert main(["train", str(tmp_path), "--sequence-length", "4", "--batch-size", "2", "--epochs", "1", "--model-profile", str(LANGUAGE_PROFILE), "--max-new-tokens", "0"]) == 0
 
     output = capsys.readouterr().out
     assert "Validation metrics:" in output
@@ -108,7 +109,7 @@ def test_train_creates_an_auditable_run_and_strictly_resumes(tmp_path: Path) -> 
 
     assert main([
         "train", str(dataset), "--runs-dir", str(runs), "--name", "tiny", "--sequence-length", "4",
-        "--batch-size", "2", "--epochs", "1", "--embedding-dim", "4", "--hidden-dim", "4",
+        "--batch-size", "2", "--epochs", "1", "--model-profile", str(LANGUAGE_PROFILE),
         "--sample-frequency", "1", "--checkpoint-frequency", "1", "--max-new-tokens", "0",
     ]) == 0
 
