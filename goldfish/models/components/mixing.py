@@ -30,6 +30,34 @@ class _SinkhornProjection(nn.Module):
         return self.normalization_steps(logits.float()).exp()
 
 
+class UnconstrainedMixer(nn.Module):
+    """Mix channels with an unconstrained learned linear map."""
+
+    def __init__(self, num_channels: int) -> None:
+        super().__init__()
+        if num_channels <= 0:
+            raise ValueError("num_channels must be positive")
+        self.num_channels = num_channels
+        self.mixing = nn.Linear(num_channels, num_channels, bias=False)
+        nn.init.eye_(self.mixing.weight)
+
+    def mixing_matrix(self) -> Tensor:
+        """Return the unconstrained matrix with rows as output channels."""
+        return self.mixing.weight
+
+    def forward(self, channels: Tensor) -> Tensor:
+        """Mix an input shaped ``[..., N, D]`` without changing its shape."""
+        if channels.ndim < 2:
+            raise ValueError(f"channels must have shape [..., {self.num_channels}, features], got {tuple(channels.shape)}")
+        if channels.shape[-2] != self.num_channels:
+            raise ValueError(
+                f"channels must have {self.num_channels} channels at dimension -2, got {channels.shape[-2]}"
+            )
+        if channels.shape[-1] == 0:
+            raise ValueError("channels must have a non-empty feature dimension")
+        return torch.matmul(self.mixing.weight.to(dtype=channels.dtype), channels)
+
+
 class DoublyStochasticMixer(nn.Module):
     """Mix channels with a learnable doubly stochastic matrix.
 

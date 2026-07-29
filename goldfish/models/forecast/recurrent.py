@@ -6,7 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from goldfish.core import ModelOutput
-from goldfish.models.components import DoublyStochasticMixer, GRUBackbone, LSTMBackbone
+from goldfish.models.components import DoublyStochasticMixer, GRUBackbone, LSTMBackbone, UnconstrainedMixer
 
 
 class ForecastBatch(Protocol):
@@ -55,8 +55,10 @@ class LSTMForecastModel(_RecurrentForecastModel):
         self.backbone = LSTMBackbone(feature_count, hidden_dim, num_layers=num_layers, dropout=dropout)
 
 
-class MultiHeadLSTMForecastModel(nn.Module):
-    """Parallel LSTM heads fused by a doubly stochastic channel mixer."""
+class _MultiHeadLSTMForecastModel(nn.Module):
+    """Shared parallel LSTM encoder and head-fusion implementation."""
+
+    mixer: DoublyStochasticMixer | UnconstrainedMixer
 
     def __init__(
         self,
@@ -68,7 +70,6 @@ class MultiHeadLSTMForecastModel(nn.Module):
         num_heads: int = 4,
         num_layers: int = 1,
         dropout: float = 0.0,
-        sinkhorn_iterations: int = 20,
     ) -> None:
         super().__init__()
         if min(feature_count, target_count, horizon_count, hidden_dim, num_heads, num_layers) <= 0:
@@ -91,7 +92,6 @@ class MultiHeadLSTMForecastModel(nn.Module):
             )
             for _ in range(num_heads)
         )
-        self.mixer = DoublyStochasticMixer(num_heads, sinkhorn_iterations=sinkhorn_iterations)
         self.fusion = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim))
         self.forecast_head = nn.Linear(hidden_dim, horizon_count * target_count)
         self.target_count = target_count
@@ -108,3 +108,56 @@ class MultiHeadLSTMForecastModel(nn.Module):
             batch.inputs.shape[0], self.horizon_count, self.target_count
         )
         return ModelOutput(predictions={"forecast": forecast}, representations=representations)
+
+
+class MultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
+    """Parallel LSTM heads fused by a doubly stochastic channel mixer."""
+
+    def __init__(
+        self,
+        feature_count: int,
+        target_count: int,
+        horizon_count: int,
+        hidden_dim: int,
+        *,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        sinkhorn_iterations: int = 20,
+    ) -> None:
+        super().__init__(
+            feature_count,
+            target_count,
+            horizon_count,
+            hidden_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.mixer = DoublyStochasticMixer(num_heads, sinkhorn_iterations=sinkhorn_iterations)
+
+
+class UnconstrainedMultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
+    """Parallel LSTM heads fused by an unconstrained learned linear mixer."""
+
+    def __init__(
+        self,
+        feature_count: int,
+        target_count: int,
+        horizon_count: int,
+        hidden_dim: int,
+        *,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__(
+            feature_count,
+            target_count,
+            horizon_count,
+            hidden_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.mixer = UnconstrainedMixer(num_heads)

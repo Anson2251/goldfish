@@ -186,53 +186,126 @@ This is an awkward regularization point for this architecture:
 
 The exact dropout mask behavior is backend-dependent and should not be assumed to be a stable public PyTorch API guarantee. The important architectural fact is that dropout changes the distribution of final head states seen by the mixer during training.
 
-## Observed Fourier long-lookback experiment
+## Experimental evidence and limits
 
-The following runs use the same `data/fourier-lb256` dataset and the same core configuration:
+### Dataset and objective
+
+All runs below use `data/fourier-lb256`:
+
+- one ordered, deterministic Fourier-series trajectory;
+- `lookback: 256`, horizons `[1, 5, 20]`;
+- inputs `[signal, trend, phase_sin, phase_cos]` and target `signal`;
+- 19,725 training windows and 3,980 validation windows;
+- train-only standard normalization; and
+- normalized MSE as the optimization and selection metric.
+
+This is a deliberately favorable function-approximation problem. The current signal, a monotonic trend coordinate, and sine/cosine phase coordinates are supplied directly to the model; the future target is therefore strongly determined by the inputs. The validation and test ranges are later contiguous sections of the same trajectory, and their trend values lie outside the training range. Results measure interpolation/extrapolation behavior on this synthetic process, not robustness to stochastic noise, changing dynamics, missing phase features, or unrelated datasets.
+
+All cited runs use AdamW (`lr=0.001`, `weight_decay=0.0001`), batch size `2048`, two LSTM layers, and cosine learning-rate scheduling with `T_max=500`. With a 1,000-epoch budget, this scheduler completes two cosine cycles: the learning rate is near zero at epochs 500 and 1,000 and returns near its initial value around epoch 501. Consequently, loss movement across the full run is affected by the schedule and should not by itself be described as model instability.
+
+Runs were resumed after interruption where necessary. The run metadata can retain the earlier interruption event; the metrics files are the source of truth for the epochs actually recorded.
+
+### Inter-layer dropout comparison
+
+`exp74` and `exp75` differ only in LSTM inter-layer dropout. Both use eight heads, `hidden_dim: 128`, and Sinkhorn mixing.
+
+| Run | LSTM dropout | Recorded epochs | Best validation loss | Best epoch | Final recorded validation loss |
+|---|---:|---:|---:|---:|---:|
+| `exp74` | `0.05` | 498 | `0.09536` | 154 | `0.13923` |
+| `exp75` | `0.00` | 999 | `0.04246` | 700 | `0.08209` |
+
+The no-dropout run achieved the lower best validation loss in this pair. This supports using `dropout: 0.0` as the starting point for this specific synthetic benchmark.
+
+It does **not** establish that inter-layer dropout is harmful in general. The comparison contains one training trajectory per setting, uses unequal recorded durations, and `exp75` traverses a second cosine cycle that `exp74` does not. To make a stronger claim, repeat both settings over fixed seeds and compare the distribution of a prespecified metric at equivalent schedule positions.
+
+### Mixer-constraint ablation
+
+The mixer ablation fixes the multi-head shape at four heads of width eight (`hidden_dim: 32`), two LSTM layers, and zero LSTM dropout. `exp73` uses the Sinkhorn-projected doubly stochastic mixer; `exp77` replaces it with an unconstrained learned `4 × 4` matrix. Both matrices have 16 learned scalar parameters and start at identity, so the comparison isolates the parameterization of the static post-LSTM mixer.
+
+`exp78` is a separate single-LSTM reference with width 20. It is approximately parameter-budget matched, not width- or compute-matched.
+
+| Architecture | Parameters | Total mult-adds | Comparison role |
+|---|---:|---:|---|
+| 4 heads × width 8, doubly stochastic mixer | 6,067 | 1.18 M | constrained multi-head |
+| 4 heads × width 8, unconstrained mixer | 6,067 | 1.18 M | direct mixer ablation |
+| Single width-20 LSTM | 5,503 | 1.39 M | parameter-near reference |
+
+| Run | Model | Final train loss | Final validation loss | Best validation loss |
+|---|---|---:|---:|---:|
+| `exp73` | constrained multi-head | `0.01646` | `0.01857` | `0.01584` at epoch 961 |
+| `exp77` | unconstrained multi-head | `0.01610` | `0.03228` | `0.02544` at epoch 993 |
+| `exp78` | single width-20 LSTM | `0.00509` | `0.00929` | `0.00772` at epoch 958 |
+
+For this one-run comparison, constraining the mixer improved the multi-head model's best validation loss from `0.02544` to `0.01584`, while final training losses were nearly equal. That is consistent with the constraint acting as a useful inductive bias or regularizer for the static fusion step on this dataset.
+
+The learned unconstrained matrix also departed from identity and contains negative coefficients, whereas the constrained mixer remains a non-negative, row- and column-normalized map. This verifies that the ablation exercised the intended additional freedoms. It does not identify which freedom—negative cancellation, unequal source-head usage, or gain changes—caused the validation gap.
+
+The single LSTM is better than both multi-head variants in this experiment. This should not be interpreted as an isolated effect of mixing: the architectures differ in recurrent connectivity. The single LSTM allows its 20 state dimensions to interact at every recurrent gate and timestep; independent heads cannot exchange information until their output sequences reach the static mixer. On this low-dimensional, feature-rich deterministic signal, that unified recurrent state is the stronger observed inductive bias.
+
+### Training trajectories
+
+The full trajectories are informative because the constrained and unconstrained multi-head models begin similarly, then separate while retaining comparable training loss. The selected checkpoints below use normalized MSE.
+
+| Epoch | `exp73` constrained train / validation | `exp77` unconstrained train / validation | `exp78` single LSTM train / validation |
+|---:|---:|---:|---:|
+| 40 | `0.20201 / 0.24622` | `0.20775 / 0.25146` | `0.11072 / 0.16783` |
+| 50 | `0.19329 / 0.23532` | `0.19953 / 0.23225` | `0.08391 / 0.12482` |
+| 100 | `0.07679 / 0.09971` | `0.07539 / 0.12394` | `0.03556 / 0.06664` |
+| 250 | `0.03399 / 0.05075` | `0.03482 / 0.10202` | `0.01132 / 0.02451` |
+| 500 | `0.02239 / 0.03279` | `0.02657 / 0.06644` | `0.00710 / 0.01671` |
+| 750 | `0.01782 / 0.02658` | `0.02025 / 0.04530` | `0.00756 / 0.01246` |
+| 1000 | `0.01646 / 0.01857` | `0.01610 / 0.03228` | `0.00509 / 0.00929` |
+
+At epoch 50, the unconstrained mixer is slightly ahead on validation loss (`0.23225` versus `0.23532`). By epoch 100, its validation loss is higher despite essentially the same training loss; the difference is larger by epochs 250 and 500. Thus the observed gap is not explained by an obviously weaker initial fit or by failure to reduce the training objective.
+
+The following descriptive statistics summarize epochs 40–1000:
+
+| Statistic | `exp73` constrained | `exp77` unconstrained | `exp78` single LSTM |
+|---|---:|---:|---:|
+| Mean train loss | `0.03301` | `0.03494` | `0.01267` |
+| Mean validation loss | `0.04476` | `0.07307` | `0.02534` |
+| Mean validation minus train loss | `0.01174` | `0.03813` | `0.01267` |
+| Mean absolute validation-loss change per epoch | `0.00367` | `0.00886` | `0.00201` |
+
+Within this recorded trajectory, the unconstrained mixer has a larger train-validation gap and larger epoch-to-epoch validation movement than the constrained mixer. Those are useful observations when diagnosing the run. They are not, by themselves, an estimate of generalization variance: adjacent epochs share model state, data, and optimizer history, and each architecture has only one random initialization/training path.
+
+The schedule also matters when reading the curves. Each 500-epoch segment is a separate cosine descent. All three models achieve their best recorded loss in the second cycle, and all three improve on their first-cycle best:
+
+| Run | Best validation loss, epochs 1–500 | Best validation loss, epochs 501–1000 |
+|---|---:|---:|
+| `exp73` constrained | `0.03219` at epoch 430 | `0.01584` at epoch 961 |
+| `exp77` unconstrained | `0.05699` at epoch 295 | `0.02544` at epoch 993 |
+| `exp78` single LSTM | `0.01645` at epoch 437 | `0.00772` at epoch 958 |
+
+Accordingly, the late-cycle improvements support continued optimization under the restarted schedule; fluctuations near a cycle boundary should not be attributed solely to the mixer. A more decisive trajectory study would repeat each architecture over several fixed seeds and compare both checkpoint minima and loss at matched cycle endpoints.
+
+### Ablation conclusions
+
+The ablations answer different questions and should not be conflated:
+
+1. **Inter-layer LSTM dropout:** in the available `exp74`/`exp75` pair, `dropout: 0.0` achieved the lower recorded best validation loss (`0.04246` versus `0.09536`). This is sufficient to prefer zero dropout as the baseline for this benchmark, but the runs have unequal recorded durations and only one trajectory per setting.
+2. **Static mixer constraint:** holding the four-head architecture, parameter count, initialization form, optimizer, and training budget fixed, Sinkhorn-constrained mixing improved the best validation loss from `0.02544` to `0.01584`. The nearly identical final train losses (`0.01610` unconstrained versus `0.01646` constrained) make a simple capacity or optimization-failure explanation less compelling. The result supports the constraint as a useful inductive bias for static head fusion on this dataset.
+3. **Multi-head architecture versus a single recurrent state:** the width-20 single LSTM was better than either multi-head variant (`0.00772` best validation loss). This is not a mixer ablation: it changes recurrent connectivity, parameter count, and compute. It shows that the present independent-head design has not demonstrated an accuracy advantage on this task.
+
+Taken together, the most defensible design conclusion is conditional: **if using this static multi-head LSTM on `fourier-lb256`, retain the doubly stochastic mixer and begin without inter-layer dropout; for accuracy on this dataset, prefer the single-LSTM reference.** None of these comparisons establishes the same ordering for other seeds, datasets, feature sets, or dynamic mixing architectures.
+
+### What the experiments support
+
+For `data/fourier-lb256`, the current evidence is:
 
 ```text
-family: forecast
-name: multihead-lstm
-hidden_dim: 128
-num_layers: 2
-num_heads: 8
-sinkhorn_iterations: 20
-optimizer: AdamW
-learning_rate: 0.001
-weight_decay: 0.0001
-scheduler: cosine, T_max=500
-batch_size: 2048
+single width-20 LSTM > constrained 4-head LSTM > unconstrained 4-head LSTM
 ```
 
-The intentional difference is LSTM inter-layer dropout.
+The strength of the evidence differs by claim:
 
-| Run | Dropout | Best validation loss | Best epoch | Latest observed validation loss |
-|---|---:|---:|---:|---:|
-| `exp74` | `0.05` | `0.09536` | `154` | `0.13923` at epoch `498` |
-| `exp75` | `0.00` | `0.04477` | `385` | `0.04666` at epoch `448` |
-
-Selected trajectories:
-
-| Epoch | `exp74` train / validation loss | `exp75` train / validation loss |
-|---:|---:|---:|
-| 10 | `0.24570 / 0.28892` | `0.23821 / 0.28469` |
-| 20 | `0.21689 / 0.25917` | `0.20729 / 0.24650` |
-| 50 | `0.11065 / 0.20400` | `0.11758 / 0.14072` |
-| 100 | `0.06477 / 0.12100` | `0.03996 / 0.07141` |
-| 200 | `0.03507 / 0.11740` | `0.01974 / 0.04937` |
-| 400 | `0.01634 / 0.13582` | `0.01049 / 0.04832` |
-
-### Interpretation
-
-The `dropout=0.05` run reaches its best validation result much earlier, then its training loss continues falling while validation loss worsens. The `dropout=0.0` run converges to substantially lower training and validation loss and remains comparatively stable.
-
-For this deterministic Fourier forecasting task, stable representation of phase and long-range periodic context appears more valuable than layerwise LSTM regularization. The observed effect is not a small training-speed tradeoff: the no-dropout run achieves less than half the best validation loss of the `0.05` run.
-
-This is evidence for this dataset and configuration, not a universal claim that LSTM dropout is always harmful.
+- **Directly observed:** the above ordering in one recorded run of each architecture, and a lower best validation loss for no inter-layer dropout in the available dropout pair.
+- **Plausible but unproven mechanism:** doubly stochastic mixing regularizes static head fusion; inter-layer dropout may interfere with this model's temporal representation.
+- **Not established:** that either choice generalizes across seeds, noisy data, different feature sets, other time-series processes, or input-dependent mixing.
 
 ## Current recommendation
 
-For the long-lookback Fourier multi-head LSTM baseline:
+Use the following only as the starting configuration for the long-lookback Fourier multi-head baseline:
 
 ```yaml
 hidden_dim: 128
@@ -242,27 +315,22 @@ num_heads: 8
 sinkhorn_iterations: 20
 ```
 
-Do not use non-zero LSTM layer dropout by default for this architecture.
+Treat the single-LSTM model as the performance reference on this dataset; do not present the multi-head model as the preferred accuracy baseline without broader evidence.
 
-If additional regularization is needed after establishing a no-dropout baseline, prefer testing regularization after mixing rather than within the recurrent stack. A possible future design is to separate the current parameter into explicit controls:
+If regularization is needed, test it in a controlled seed sweep. Separating recurrent and fusion regularization is reasonable, but fusion dropout has not yet been implemented or evaluated:
 
 ```yaml
 lstm_dropout: 0.0
 fusion_dropout: 0.0
 ```
 
-where fusion dropout would be applied after:
-
-```text
-mixer → flatten → LayerNorm → Linear
-```
-
-This keeps the recurrent temporal state construction and mixer input distribution intact while still allowing regularization of the final fused representation.
+A fusion-dropout experiment should apply dropout after `mixer → flatten → LayerNorm → Linear` and compare it with the same seeds, schedule, and stopping rule.
 
 ## Open questions
 
-1. Does post-fusion dropout improve validation loss without degrading phase fidelity?
-2. Would head-level dropout, which removes whole heads rather than intermediate LSTM features, be a better regularizer for the mixer?
-3. Does dynamic, input-dependent mixing benefit from a different dropout strategy?
-4. Does the dropout conclusion persist for noisy, non-deterministic, or lower-sample forecasting datasets?
-5. Should the model constructor reject `num_layers=1` with non-zero LSTM dropout rather than silently accepting an ineffective setting?
+1. Across fixed seeds, what are the mean and variance of best and terminal validation loss for each mixer?
+2. Does the mixer result remain when phase features or the current target are withheld, or when noise and regime changes are added?
+3. Is the apparent dropout advantage retained when both settings run for the same schedule cycles?
+4. Does post-fusion or head-level dropout improve a multi-head model without disrupting recurrent state construction?
+5. Would an architecture that exchanges information between heads during recurrent updates close the gap to the single LSTM?
+6. Should the model constructor reject `num_layers=1` with non-zero LSTM dropout rather than silently accepting an ineffective setting?
