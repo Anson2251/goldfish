@@ -82,16 +82,19 @@ class _MultiHeadLSTMForecastModel(nn.Module):
         self.head_dim = hidden_dim // num_heads
         self.input_projections = nn.ModuleList(nn.Linear(feature_count, self.head_dim) for _ in range(num_heads))
         self.input_normalizations = nn.ModuleList(nn.LayerNorm(self.head_dim) for _ in range(num_heads))
-        self.heads = nn.ModuleList(
-            nn.LSTM(
-                input_size=self.head_dim,
-                hidden_size=self.head_dim,
-                num_layers=num_layers,
-                dropout=dropout,
-                batch_first=True,
+        self.head_layers = nn.ModuleList(
+            nn.ModuleList(
+                nn.LSTM(
+                    input_size=self.head_dim,
+                    hidden_size=self.head_dim,
+                    num_layers=1,
+                    batch_first=True,
+                )
+                for _ in range(num_layers)
             )
             for _ in range(num_heads)
         )
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.fusion = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim))
         self.forecast_head = nn.Linear(hidden_dim, horizon_count * target_count)
         self.target_count = target_count
@@ -100,9 +103,13 @@ class _MultiHeadLSTMForecastModel(nn.Module):
     def forward(self, batch: ForecastBatch) -> ModelOutput:
         if batch.inputs.ndim != 3:
             raise ValueError("forecast inputs must have shape [batch, lookback, feature_count].")
-        head_states = [head(normalization(projection(batch.inputs)))[0] for projection, normalization, head in zip(self.input_projections, self.input_normalizations, self.heads, strict=True)]
-        stacked_states = torch.stack(head_states, dim=-2)
-        mixed_states = self.mixer(stacked_states)
+        head_states = [normalization(projection(batch.inputs)) for projection, normalization in zip(self.input_projections, self.input_normalizations, strict=True)]
+        for layer_index in range(len(self.head_layers[0])):
+            head_states = [head_layers[layer_index](states)[0] for head_layers, states in zip(self.head_layers, head_states, strict=True)]
+            mixed_states = self.mixer(torch.stack(head_states, dim=-2))
+            if layer_index + 1 < len(self.head_layers[0]):
+                mixed_states = self.dropout(mixed_states)
+            head_states = list(mixed_states.unbind(dim=-2))
         representations = self.fusion(mixed_states.flatten(start_dim=-2))
         forecast = self.forecast_head(representations[:, -1]).reshape(
             batch.inputs.shape[0], self.horizon_count, self.target_count
