@@ -1,0 +1,14 @@
+schema_version: 1
+model:
+  family: forecast
+  name: multihead-lstm-distinct
+  parameters:
+    hidden_dim: 32
+    num_layers: 2
+    dropout: 0.0
+    num_heads: 4
+    sinkhorn_iterations: 20
+    mixer_initialization: identity
+    mixer_random_std: 1.0
+    mixer_uniform_ratio: 0.0
+    use_distinct_mixers: true

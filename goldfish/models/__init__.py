@@ -13,6 +13,7 @@ model_registry.register("forecast", "lstm", LSTMForecastModel)
 model_registry.register("forecast", "lstm-128x2", LSTMForecastModel)
 model_registry.register("forecast", "multihead-lstm", MultiHeadLSTMForecastModel)
 model_registry.register("forecast", "multihead-lstm-unconstrained", UnconstrainedMultiHeadLSTMForecastModel)
+model_registry.register("forecast", "multihead-lstm-distinct", MultiHeadLSTMForecastModel)
 
 __all__ = [
     "DoublyStochasticMixer",

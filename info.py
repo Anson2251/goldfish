@@ -34,17 +34,32 @@ class _ForecastSummaryModel(nn.Module):
         if hasattr(self.model, "backbone") and hasattr(self.model, "forecast_head"):
             states, _ = self.model.backbone(inputs)  # type: ignore[attr-defined]
             return self.model.forecast_head(states[:, -1])  # type: ignore[attr-defined]
-        if all(hasattr(self.model, name) for name in ("input_projections", "input_normalizations", "heads", "mixer", "fusion", "forecast_head")):
+        if all(hasattr(self.model, name) for name in ("input_projections", "input_normalizations", "head_layers", "mixer", "fusion", "forecast_head")):
             head_states = [
-                head(normalization(projection(inputs)))[0]
-                for projection, normalization, head in zip(
+                normalization(projection(inputs))
+                for projection, normalization in zip(
                     self.model.input_projections,  # type: ignore[attr-defined]
                     self.model.input_normalizations,  # type: ignore[attr-defined]
-                    self.model.heads,  # type: ignore[attr-defined]
                     strict=True,
                 )
             ]
-            mixed_states = self.model.mixer(torch.stack(head_states, dim=-2))  # type: ignore[attr-defined]
+            num_layers = len(self.model.head_layers[0])  # type: ignore[attr-defined]
+            for layer_index in range(num_layers):
+                head_states = [
+                    head_layers[layer_index](states)[0]
+                    for head_layers, states in zip(
+                        self.model.head_layers,  # type: ignore[attr-defined]
+                        head_states,
+                        strict=True,
+                    )
+                ]
+                stacked = torch.stack(head_states, dim=-2)
+                # Support optional per-layer distinct mixers
+                if hasattr(self.model, 'mixers'):  # type: ignore[attr-defined]
+                    mixed_states = self.model.mixers[layer_index](stacked)  # type: ignore[attr-defined]
+                else:
+                    mixed_states = self.model.mixer(stacked)  # type: ignore[attr-defined]
+                head_states = list(mixed_states.unbind(dim=-2))
             representations = self.model.fusion(mixed_states.flatten(start_dim=-2))  # type: ignore[attr-defined]
             return self.model.forecast_head(representations[:, -1])  # type: ignore[attr-defined]
         raise TypeError(f"Unsupported forecast model for info summary: {type(self.model).__name__}")

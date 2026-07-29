@@ -104,10 +104,16 @@ class _MultiHeadLSTMForecastModel(nn.Module):
         if batch.inputs.ndim != 3:
             raise ValueError("forecast inputs must have shape [batch, lookback, feature_count].")
         head_states = [normalization(projection(batch.inputs)) for projection, normalization in zip(self.input_projections, self.input_normalizations, strict=True)]
-        for layer_index in range(len(self.head_layers[0])):
+        num_layers = len(self.head_layers[0])
+        for layer_index in range(num_layers):
             head_states = [head_layers[layer_index](states)[0] for head_layers, states in zip(self.head_layers, head_states, strict=True)]
-            mixed_states = self.mixer(torch.stack(head_states, dim=-2))
-            if layer_index + 1 < len(self.head_layers[0]):
+            stacked = torch.stack(head_states, dim=-2)
+            # Support optional per-layer distinct mixers
+            if hasattr(self, 'mixers'):
+                mixed_states = self.mixers[layer_index](stacked)
+            else:
+                mixed_states = self.mixer(stacked)
+            if layer_index + 1 < num_layers:
                 mixed_states = self.dropout(mixed_states)
             head_states = list(mixed_states.unbind(dim=-2))
         representations = self.fusion(mixed_states.flatten(start_dim=-2))
@@ -134,6 +140,7 @@ class MultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
         mixer_initialization: str = "identity",
         mixer_random_std: float = 1.0,
         mixer_uniform_ratio: float = 0.0,
+        use_distinct_mixers: bool = False,
     ) -> None:
         super().__init__(
             feature_count,
@@ -144,7 +151,22 @@ class MultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
             num_layers=num_layers,
             dropout=dropout,
         )
-        self.mixer = DoublyStochasticMixer(num_heads, sinkhorn_iterations=sinkhorn_iterations, initialization=mixer_initialization, random_std=mixer_random_std, uniform_ratio=mixer_uniform_ratio)
+        mixer_kwargs = dict(
+            sinkhorn_iterations=sinkhorn_iterations,
+            initialization=mixer_initialization,
+            random_std=mixer_random_std,
+            uniform_ratio=mixer_uniform_ratio,
+        )
+        if use_distinct_mixers:
+            self.mixers = nn.ModuleList(
+                DoublyStochasticMixer(num_heads, **mixer_kwargs)
+                for _ in range(num_layers)
+            )
+            # Backward compatibility: alias self.mixer to the first mixer so
+            # existing code/tests that access model.mixer still work.
+            self.mixer = self.mixers[0]
+        else:
+            self.mixer = DoublyStochasticMixer(num_heads, **mixer_kwargs)
 
 
 class UnconstrainedMultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
