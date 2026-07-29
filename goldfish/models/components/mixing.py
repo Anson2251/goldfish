@@ -72,20 +72,41 @@ class DoublyStochasticMixer(nn.Module):
         num_channels: int,
         *,
         sinkhorn_iterations: int = 20,
+        initialization: str = "identity",
         identity_strength: float = 10.0,
+        random_std: float = 1.0,
+        uniform_ratio: float = 0.0,
     ) -> None:
         super().__init__()
         if num_channels <= 0:
             raise ValueError("num_channels must be positive")
         if sinkhorn_iterations <= 0:
             raise ValueError("sinkhorn_iterations must be positive")
+        if initialization not in {"identity", "random", "uniform"}:
+            raise ValueError("initialization must be 'identity', 'random', or 'uniform'")
         if identity_strength <= 0:
             raise ValueError("identity_strength must be positive")
+        if random_std <= 0:
+            raise ValueError("random_std must be positive")
+        if not 0 <= uniform_ratio <= 1:
+            raise ValueError("uniform_ratio must be in [0, 1]")
+        if initialization == "uniform" and num_channels == 1 and uniform_ratio > 0:
+            raise ValueError("uniform initialization requires num_channels > 1 when uniform_ratio > 0")
 
         self.num_channels = num_channels
         self.sinkhorn_iterations = sinkhorn_iterations
+        self.initialization = initialization
         self.projection = _SinkhornProjection(sinkhorn_iterations)
-        self.logits = nn.Parameter(torch.eye(num_channels) * identity_strength)
+        if initialization == "identity":
+            logits = torch.eye(num_channels) * identity_strength
+        elif initialization == "uniform":
+            off_diag = uniform_ratio / (num_channels - 1)
+            matrix = torch.full((num_channels, num_channels), off_diag)
+            matrix.fill_diagonal_(1 - uniform_ratio)
+            logits = matrix.log()
+        else:
+            logits = torch.randn(num_channels, num_channels) * random_std
+        self.logits = nn.Parameter(logits)
 
     def mixing_matrix(self) -> Tensor:
         """Return the learned channel mixing matrix with shape ``[N, N]``.

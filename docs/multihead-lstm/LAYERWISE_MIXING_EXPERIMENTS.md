@@ -200,3 +200,191 @@ A seed sweep is especially important because the currently observed advantage of
 ## Current working conclusion
 
 Layerwise mixing is the leading architectural direction for this multi-head LSTM. On the available `fourier-lb256` run, it substantially improves over output-only mixing and reaches the single-LSTM reference. The result is promising but does not yet isolate whether the gain comes from learnable cross-head routing, identity-preserving layerwise execution, or ordinary run-to-run variation.
+
+---
+
+## UPDATE: Random-init ablation (exp80)
+
+### Setup
+
+`exp80` evaluates the layerwise doubly stochastic mixer with random initialization, using the same data lock, model dimensions, optimizer, scheduler, and epoch budget as `exp79`:
+
+```yaml
+model:
+  family: forecast
+  name: multihead-lstm
+  parameters:
+    hidden_dim: 32
+    num_heads: 4
+    num_layers: 2
+    dropout: 0.0
+    sinkhorn_iterations: 20
+    mixer_initialization: random
+    mixer_random_std: 1.0
+```
+
+The only difference from `exp79` is `mixer_initialization: random`.
+
+The run environment records Git commit `36c31fbdb29f84148a5a7a151d4d8cb54b277384` and `git_dirty: true`. Data fingerprint, normalizer fingerprint, and split fingerprints match `exp73` and `exp79`.
+
+### Results
+
+| Run | Mixer init | Best validation loss | Best epoch | Final validation loss |
+|---|---:|---:|---:|
+| `exp77` | identity, output-only unconstrained | `0.02544` | 993 | `0.03228` |
+| `exp73` | identity, output-only doubly stochastic | `0.01584` | 961 | `0.01857` |
+| `exp78` | single LSTM, width 20 | `0.00772` | 958 | `0.00929` |
+| `exp79` | identity, layerwise doubly stochastic | **`0.00705`** | 913 | **`0.00893`** |
+| `exp80` | **random**, layerwise doubly stochastic | **`0.04832`** | 968 | **`0.05208`** |
+
+Random initialization degraded best validation loss by a factor of 6.9× relative to identity-init (`0.00705 → 0.04832`). `exp80` is also worse than the output-only unconstrained baseline `exp77` (1.9×) and the output-only constrained baseline `exp73` (3.1×).
+
+### Training trajectory
+
+| Epoch | `exp79` identity-init train / validation | `exp80` random-init train / validation |
+|---:|---:|---:|
+| 1 | `1.01938 / 1.60837` | `0.96333 / 2.02788` |
+| 10 | `0.35377 / 0.48669` | `0.35935 / 0.49358` |
+| 20 | `0.23027 / 0.30023` | `0.24147 / 0.31370` |
+| 30 | `0.20727 / 0.26507` | `0.22168 / 0.28185` |
+| 50 | `0.17252 / 0.20267` | `0.19930 / 0.23910` |
+| 100 | `0.05885 / 0.08763` | `0.09255 / 0.13421` |
+| 250 | `0.01197 / 0.03041` | `0.05480 / 0.07405` |
+| 500 | `0.00604 / 0.01812` | `0.04501 / 0.06538` |
+| 750 | `0.00496 / 0.01850` | `0.04617 / 0.05664` |
+| 1000 | `0.00469 / 0.00893` | `0.03605 / 0.05208` |
+
+At epoch 1, random-init has slightly better training loss but worse validation loss—cross-head routing is immediately a worse prior for this dataset. The gap is visible by epoch 50, clear by epoch 250, and persists to epoch 1,000. The random-init run makes minimal progress after epoch 250 (`0.074 → 0.052`) while identity-init continues improving through the second cosine cycle (`0.030 → 0.009`).
+
+This is not a slow-start problem that recovers given enough training.
+
+### Final mixer
+
+```text
+P_exp80 =
+[[0.525, 0.227, 0.095, 0.152],
+ [0.333, 0.226, 0.080, 0.361],
+ [0.064, 0.276, 0.407, 0.254],
+ [0.079, 0.271, 0.418, 0.233]]
+```
+
+| Run | Mixer init | `||P - I||_F` | `||P - I||_2` | Total off-diagonal mass | Diagonal range |
+|---|---:|---:|---:|---:|
+| `exp73` | identity | `3.05e-4` | `1.87e-4` | `5.26e-4` | `[0.999857, 0.999881]` |
+| `exp79` | identity | `2.62e-4` | `1.77e-4` | `4.43e-4` | `[0.999861, 0.999927]` |
+| `exp80` | random | **`1.58`** | **`1.15`** | **`2.61`** | `[0.226, 0.525]` |
+
+The random-init final mixer is far from identity: 65% of total routing mass sits off diagonal. The model learned a stable, non-trivial cross-head routing pattern under the doubly stochastic constraint, but that pattern has poor validation performance. The model did not recover identity-like routing during training.
+
+### Interpretation
+
+1. **Identity initialization is essential, not optional.** Changing only the mixer initialization degrades performance by 6.9×—the largest single-intervention effect observed across all ablations. This is not a slow-start problem; the gap persists and widens through epoch 1,000.
+
+2. **For this dataset, near-independent head encoding is a strong inductive bias.** Forcing substantial cross-head communication from epoch 1—even under the doubly stochastic constraint—disrupts early head specialization. Each head likely needs to develop a useful temporal representation before constrained routing can improve it.
+
+3. **The mechanism of identity-init gain remains undetermined.** The final mixer is close to identity, but the advantage is large and visible by epoch 50. The fixed-identity-mixer control (no learnable mixer parameters, `M = I` at every layer) is now the highest-priority next ablation to distinguish the contributions of explicit layer splitting from learned near-identity routing.
+
+---
+
+## UPDATE: Uniform-init ablation (exp81)
+
+### Setup
+
+`exp81` evaluates the layerwise doubly stochastic mixer with uniform initialization, using the same data lock, model dimensions, optimizer, scheduler, and epoch budget as `exp79`:
+
+```yaml
+model:
+  family: forecast
+  name: multihead-lstm
+  parameters:
+    hidden_dim: 32
+    num_heads: 4
+    num_layers: 2
+    dropout: 0.0
+    sinkhorn_iterations: 20
+    mixer_initialization: uniform
+    mixer_uniform_ratio: 0.3
+```
+
+The only difference from `exp79` is `mixer_initialization: uniform` with `mixer_uniform_ratio: 0.3`.
+
+The uniform initialization constructs a doubly stochastic matrix with diagonal `1 - uniform_ratio` and uniform off-diagonal entries `uniform_ratio / (num_channels - 1)`. For `ratio: 0.3` and `num_heads: 4`, the initial projected matrix is:
+
+```text
+diag = 0.7,  off-diag = 0.1
+```
+
+This places the initial mixer between the near-identity warm start of `exp79` (`diag ≈ 1.0`) and the diffuse random start of `exp80` (`diag ≈ 0.25`), providing a controlled amount of initial cross-head communication.
+
+The run environment records Git commit `36c31fbdb29f84148a5a7a151d4d8cb54b277384` and `git_dirty: true`. Data fingerprint, normalizer fingerprint, and split fingerprints match `exp73`, `exp79`, and `exp80`.
+
+### Results
+
+| Run | Architecture | Mixer init | Best validation loss | Best epoch | Final validation loss |
+|---|---|---|---:|---:|---:|
+| `exp77` | Output-only, unconstrained | identity-biased learned | `0.02544` | 993 | `0.03228` |
+| `exp73` | Output-only, doubly stochastic | identity warm-start | `0.01584` | 961 | `0.01857` |
+| `exp78` | Single LSTM, width 20 | — | `0.00772` | 958 | `0.00929` |
+| `exp79` | Layerwise, doubly stochastic | identity warm-start | **`0.00705`** | 913 | **`0.00893`** |
+| `exp80` | Layerwise, doubly stochastic | random | `0.04832` | 968 | `0.05208` |
+| `exp81` | Layerwise, doubly stochastic | **uniform 0.3** | **`0.03702`** | 970 | **`0.03854`** |
+
+Relative to the layerwise identity baseline (`exp79`), `exp81` degrades best validation loss by a factor of `5.2×` (`0.00705 → 0.03702`). Relative to the random-init ablation (`exp80`), `exp81` improves by `23%` (`0.04832 → 0.03702`).
+
+`exp81` also falls short of the output-only doubly stochastic baseline (`exp73`, `0.01584`) by a factor of `2.3×`, and is approximately `4.1×` worse than the single-LSTM reference (`exp78`).
+
+### Training trajectory
+
+| Epoch | `exp79` identity-init | `exp81` uniform-init (0.3) | `exp80` random-init |
+|---:|---:|---:|---:|
+| 1 | `1.01938 / 1.60837` | `1.09158 / 2.00298` | `0.96333 / 2.02788` |
+| 10 | `0.35377 / 0.48669` | `0.37528 / 0.54623` | `0.35935 / 0.49358` |
+| 20 | `0.23027 / 0.30023` | `0.23747 / 0.31838` | `0.24147 / 0.31370` |
+| 50 | `0.17252 / 0.20267` | **`0.14928 / 0.17467`** | `0.19930 / 0.23910` |
+| 100 | `0.05885 / 0.08763` | `0.08820 / 0.11610` | `0.09255 / 0.13421` |
+| 250 | `0.01197 / 0.03041` | `0.04134 / 0.08524` | `0.05480 / 0.07405` |
+| 500 | `0.00604 / 0.01812` | `0.02919 / 0.05685` | `0.04501 / 0.06538` |
+| 750 | `0.00496 / 0.01850` | `0.02724 / 0.04685` | `0.04617 / 0.05664` |
+| 1000 | `0.00469 / 0.00893` | `0.02774 / 0.03854` | `0.03605 / 0.05208` |
+
+`exp81` shows a distinct two-phase pattern:
+
+1. **Early phase (epochs 1–50):** `exp81` outperforms both `exp79` and `exp80` on validation loss. The uniform initial coupling appears to act as a useful regularization or signal-sharing prior during the first specialization stage.
+2. **Late phase (epochs 100+):** `exp79` continues to improve through the second cosine cycle, while `exp81` enters a plateau. By epoch 250 the gap is already large (`0.030` vs `0.085`), and `exp81` makes only marginal progress after epoch 500 (`0.057 → 0.039`).
+
+### Mixer inspection
+
+The initial uniform-projected matrix has `diag = 0.7` and `off-diag = 0.1` for every entry, yielding an initial off-diagonal mass of `1.20`.
+
+The final `exp81` mixer (epoch 999):
+
+```text
+P_exp81 =
+[[0.713501, 0.082055, 0.094082, 0.110362],
+ [0.076272, 0.774637, 0.072041, 0.077050],
+ [0.099441, 0.072734, 0.742409, 0.085416],
+ [0.110786, 0.070573, 0.091469, 0.727172]]
+```
+
+| Run | Mixer init | `||P - I||_F` | `||P - I||_2` | Total off-diagonal mass | Diagonal range |
+|---|---:|---:|---:|---:|---:|
+| `exp73` | identity | `3.05e-4` | `1.87e-4` | `5.26e-4` | `[0.999857, 0.999881]` |
+| `exp79` | identity | `2.62e-4` | `1.77e-4` | `4.43e-4` | `[0.999861, 0.999927]` |
+| `exp80` | random | `1.58` | `1.15` | `2.61` | `[0.226, 0.525]` |
+| `exp81` | uniform 0.3 | **`6.05e-1`** | **`3.92e-1`** | **`1.04`** | `[0.714, 0.775]` |
+
+The final `exp81` mixer has moved only slightly from its initialization: diagonal entries rose from `0.700` to `0.713–0.775`, and total off-diagonal mass fell from `1.20` to `1.04` (a `13%` reduction). The movement is far smaller than would be needed to approach identity, and it appears to stabilize early: from epoch 219 onward the matrix changes only in the fourth decimal place.
+
+This supports the hypothesis that once head specialization has occurred under a non-identity coupling, the mixer and the head parameters become mutually locked. Gradients that would move the mixer toward identity also require the heads to undo their learned coupled representations, making the joint escape costly.
+
+### Interpretation
+
+1. **Initial cross-head coupling is not monotonically harmful, but it has a ceiling.** `exp81` outperforms `exp79` before epoch 50, yet ends up `5.2×` worse. A moderate initial blend (`diag = 0.7`) accelerates early signal sharing but appears to prevent the heads from ever reaching the depth of independent temporal specialization that `exp79` achieves.
+
+2. **The optimization landscape is likely continuous rather than a sharp two-basin problem.** `exp81` sits cleanly between `exp79` and `exp80` on both final loss and final mixer distance. There is no evidence of a sudden phase transition between "identity basin" and "random basin"; instead, performance degrades roughly monotonically with the initial off-diagonal mass.
+
+3. **The mixer trajectory matters more than the final matrix.** Both `exp73` and `exp79` end near identity, yet `exp79` is dramatically better. The difference is that `exp79` starts at identity and explores only a tiny neighborhood, while `exp81` starts far from identity and cannot recover. This suggests that **the path taken during the first ~50 epochs**, not the final checkpoint, determines whether the model can reach the high-performance regime.
+
+4. **"Delayed coupling" remains the leading explanation for the identity-init advantage.** `exp79` allows heads to specialize independently during the critical early phase, then introduces only subtle cross-head routing. `exp81` and `exp80` force coupling before useful head representations exist, and the resulting coupled representations are suboptimal even after 1,000 epochs of further training.
+
+---

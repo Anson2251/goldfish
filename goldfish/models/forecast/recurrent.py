@@ -131,6 +131,9 @@ class MultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
         num_layers: int = 1,
         dropout: float = 0.0,
         sinkhorn_iterations: int = 20,
+        mixer_initialization: str = "identity",
+        mixer_random_std: float = 1.0,
+        mixer_uniform_ratio: float = 0.0,
     ) -> None:
         super().__init__(
             feature_count,
@@ -141,7 +144,7 @@ class MultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
             num_layers=num_layers,
             dropout=dropout,
         )
-        self.mixer = DoublyStochasticMixer(num_heads, sinkhorn_iterations=sinkhorn_iterations)
+        self.mixer = DoublyStochasticMixer(num_heads, sinkhorn_iterations=sinkhorn_iterations, initialization=mixer_initialization, random_std=mixer_random_std, uniform_ratio=mixer_uniform_ratio)
 
 
 class UnconstrainedMultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
