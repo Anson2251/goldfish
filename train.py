@@ -21,6 +21,8 @@ import yaml
 from torchinfo import summary
 
 from goldfish.config import create_model_from_config, create_optimizer, create_scheduler, load_model_profile, resolve_model_config, resolve_training_config
+from goldfish.config.observability import resolve_observability_config
+from goldfish.observability import JsonlRecorder, build_probe_hook, take_first_batches
 from goldfish.data.loading import resolve_loader_settings
 from goldfish.core import Task
 from goldfish.device import resolve_device
@@ -120,6 +122,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, help="Optional random seed; required with --deterministic.")
     parser.add_argument("--deterministic", action="store_true", help="Require deterministic PyTorch algorithms; requires --seed.")
     parser.add_argument("--compile", action="store_true", help="Compile model forward execution with torch.compile.")
+    parser.add_argument("--observability", action="store_true", help="Enable probe observability declared by the model profile.")
+    parser.add_argument("--observability-batches", type=int, default=8, help="Reference batches captured for activation probes (default: 8).")
     return parser
 
 
@@ -439,24 +443,66 @@ def _numeric_resume_config(args: argparse.Namespace, config: dict[str, Any]) -> 
         "loader": {"batch_size", "num_workers", "train_workers", "val_workers", "prefetch_factor"},
         "optimization": {"optimizer", "learning_rate", "weight_decay", "momentum"},
         "scheduler": {"scheduler", "scheduler_step_timing", "scheduler_t_max", "scheduler_eta_min", "scheduler_step_size", "scheduler_gamma", "scheduler_factor", "scheduler_patience"},
+        "observability": {"observability", "observability_batches"},
     }
     model_parameters = cast(Mapping[str, Any], config["model"]["parameters"])
     runtime = {"features": [None] * int(model_parameters["feature_count"]), "targets": [None] * int(model_parameters["target_count"]), "horizons": [None] * int(model_parameters["horizon_count"])}
     requested = _numeric_config(args, config["dataset"], runtime, config["model"])
+    # Resume cannot reconstruct the profile's probe declarations, so carry the
+    # saved declarations into the requested block before comparing.
+    if args.observability and isinstance(config.get("observability"), Mapping):
+        cast(dict[str, Any], requested["observability"])["probes"] = config["observability"].get("probes")
     for section, section_options in options.items():
         if provided.intersection(section_options) and requested[section] != config.get(section):
             raise ValueError(f"resume {section} configuration is incompatible with the existing run")
     return config
 
 
-def _numeric_config(args: argparse.Namespace, manifest: Mapping[str, Any], runtime: Mapping[str, Any], model: Mapping[str, Any]) -> dict[str, Any]:
+def _build_probe_hook(config: Mapping[str, Any], data_module: Any, dataset_lock: Mapping[str, Any], run: Any) -> Any:
+    """Assemble the probe hook from the run's persisted observability block.
+
+    The reference provider captures the first reference batches from a fresh
+    validation loader iterator; the split fingerprint is read from the dataset
+    lock for reproducibility anchors.
+    """
+    observability = config.get("observability")
+    if not isinstance(observability, Mapping):
+        return None
+    probes_declared = observability.get("probes")
+    run_block = {key: value for key, value in observability.items() if key != "probes"}
+    resolved = resolve_observability_config(probes_declared, run_block)
+    if not resolved.probes:
+        return None
+
+    def reference_factory() -> Any:
+        assert resolved.reference is not None
+        return take_first_batches(iter(data_module.val_dataloader()), resolved.reference.batches)
+
+    split_fingerprint: str | None = None
+    splits = dataset_lock.get("splits")
+    if isinstance(splits, Mapping):
+        val_split = splits.get("val")
+        if isinstance(val_split, Mapping):
+            fingerprint = val_split.get("fingerprint")
+            if isinstance(fingerprint, str):
+                split_fingerprint = fingerprint
+    return build_probe_hook(
+        resolved,
+        JsonlRecorder(run.path / "artifacts" / "probes"),
+        reference_factory=reference_factory if resolved.reference is not None else None,
+        source_paths={probe.name: "profile" for probe in resolved.probes},
+        split_fingerprint=split_fingerprint,
+    )
+
+
+def _numeric_config(args: argparse.Namespace, manifest: Mapping[str, Any], runtime: Mapping[str, Any], model: Mapping[str, Any], *, observability_probes: Mapping[str, Any] | None = None) -> dict[str, Any]:
     resolved = resolve_training_config({"optimization": _optimization_overrides(args), "scheduler": _scheduler_overrides(args)})
     features = runtime["features"]
     targets = runtime["targets"]
     horizons = runtime["horizons"]
     if not isinstance(features, list) or not isinstance(targets, list) or not isinstance(horizons, list):
         raise ValueError("numeric runtime metadata is missing feature, target, or horizon declarations")
-    return {
+    config = {
         "experiment": {"name": args.name, "seed": args.seed, "deterministic": args.deterministic},
         "dataset": {"root": str(args.dataset_root), "name": manifest.get("name"), "version": manifest.get("version"), "manifest": str(args.dataset_root / "manifest.yaml"), "builder": manifest.get("builder")},
         "loader": {"batch_size": args.batch_size, "num_workers": 0, "train_workers": 0, "validation_workers": 0, "pin_memory": False, "prefetch_factor": None, "persistent_workers": False, "shuffle_train": True},
@@ -466,6 +512,15 @@ def _numeric_config(args: argparse.Namespace, manifest: Mapping[str, Any], runti
         "training": {"epochs": args.epochs, "device": args.device, "gradient_clip_norm": args.gradient_clip_norm, "compile": args.compile},
         "checkpointing": {"monitor": "validation/loss", "mode": "min", "save_frequency": args.checkpoint_frequency},
     }
+    if args.observability:
+        observability: dict[str, Any] = {
+            "enabled": True,
+            "reference": {"split": "val", "batches": args.observability_batches, "selection": "first"},
+        }
+        if observability_probes:
+            observability["probes"] = dict(observability_probes)
+        config["observability"] = observability
+    return config
 
 
 def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device: torch.device, dataset_lock: Mapping[str, Any]) -> int:
@@ -478,10 +533,13 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
     if args.resume is None:
         if args.model_profile is None:
             raise ValueError("--model-profile is required for a new run.")
-        model = resolve_model_config(load_model_profile(args.model_profile), family="forecast", runtime_parameters={"feature_count": len(data_module.runtime_metadata["features"]), "target_count": len(data_module.runtime_metadata["targets"]), "horizon_count": len(data_module.runtime_metadata["horizons"])})
+        profile = load_model_profile(args.model_profile)
+        model = resolve_model_config(profile, family="forecast", runtime_parameters={"feature_count": len(data_module.runtime_metadata["features"]), "target_count": len(data_module.runtime_metadata["targets"]), "horizon_count": len(data_module.runtime_metadata["horizons"])})
+        observability_probes = profile.get("observability")
     else:
         model = {}
-    config = _numeric_config(args, manifest, data_module.runtime_metadata, model)
+        observability_probes = None
+    config = _numeric_config(args, manifest, data_module.runtime_metadata, model, observability_probes=observability_probes)
     config_loader = cast(dict[str, Any], config["loader"])
     config_loader.update({"num_workers": max(settings.train_workers, settings.validation_workers), "train_workers": settings.train_workers, "validation_workers": settings.validation_workers, "pin_memory": settings.pin_memory, "prefetch_factor": settings.prefetch_factor, "persistent_workers": settings.persistent_workers})
     cast(dict[str, Any], config["training"])["device"] = str(device)
@@ -513,6 +571,7 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
     model = create_model_from_config(model_config)
     if bool(cast(Mapping[str, Any], config["training"]).get("compile", False)):
         model = compile_model(model)
+    probe_hook = _build_probe_hook(config, data_module, dataset_lock, run)
     optimizer = create_optimizer(model.parameters(), resolved_training.optimization)
     scheduler = create_scheduler(optimizer, resolved_training.scheduler)
     provenance = {"run_id": run.run_id, "config_fingerprint": _fingerprint(config), "dataset_fingerprint": data["locking"]["dataset_fingerprint"], "tokenizer_fingerprint": None, "normalizer_fingerprint": data["normalizer"]["fingerprint"], "model_family": model_config["family"], "model_name": model_config["name"]}
@@ -530,7 +589,7 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
         run.append_metrics({"epoch": result.epoch + 1, "global_step": result.global_step, "wall_time_seconds": time.monotonic() - started, "learning_rate": result.learning_rates[0], **metrics})
         checkpoints.on_epoch_end(model, optimizer, epoch=result.epoch, global_step=result.global_step, metrics=metrics, scheduler=scheduler)
 
-    trainer = Trainer(model, PointForecastTask(data_module.normalizer, data_module.runtime_metadata["targets"]), optimizer, scheduler=cast(Any, scheduler), scheduler_step_timing=resolved_training.scheduler.step_timing, scheduler_metric=getattr(resolved_training.scheduler, "monitor", None), device=device, gradient_clip_norm=cast(Mapping[str, Any], config["training"])["gradient_clip_norm"], on_epoch_end=on_epoch_end, progress=True)
+    trainer = Trainer(model, PointForecastTask(data_module.normalizer, data_module.runtime_metadata["targets"]), optimizer, scheduler=cast(Any, scheduler), scheduler_step_timing=resolved_training.scheduler.step_timing, scheduler_metric=getattr(resolved_training.scheduler, "monitor", None), device=device, gradient_clip_norm=cast(Mapping[str, Any], config["training"])["gradient_clip_norm"], on_epoch_end=on_epoch_end, progress=True, hooks=[probe_hook] if probe_hook is not None else [])
     run.start()
     try:
         resumed_epoch: int | None = None

@@ -69,6 +69,38 @@ def test_deterministic_training_requires_a_seed(tmp_path: Path) -> None:
         load_entry("train")([str(dataset), "--deterministic"])
 
 
+def test_numeric_training_with_observability_writes_probe_artifacts(tmp_path: Path) -> None:
+    dataset, runs = tmp_path / "dataset", tmp_path / "runs"
+    write_numeric_bundle(dataset)
+
+    assert load_entry("prepare")([str(dataset)]) == 0
+    assert load_entry("train")([
+        str(dataset), "--runs-dir", str(runs), "--name", "obs", "--epochs", "1", "--batch-size", "2",
+        "--device", "cpu", "--num-workers", "0",
+        "--model-profile", str(ROOT / "model-profiles" / "forecast" / "multihead-lstm-small.yaml"),
+        "--max-new-tokens", "0", "--observability", "--observability-batches", "1",
+    ]) == 0
+
+    probe_dir = runs / "exp1-obs" / "artifacts" / "probes"
+    assert (probe_dir / "manifest.json").is_file()
+    for name in ("mixer-state", "activation-stats"):
+        records = [json.loads(line) for line in (probe_dir / f"{name}.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert [(record["phase"], record["epoch"]) for record in records] == [
+            ("fit_start", 0),
+            ("epoch_end", 1),
+            ("fit_end", 1),
+        ]
+    manifest = json.loads((probe_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert [entry["name"] for entry in manifest["probes"]] == ["mixer-state", "activation-stats"]
+    assert manifest["probes"][0]["matched_modules"] == ["mixer"]
+    assert manifest["reference"]["batches"] == 1
+    assert "split_fingerprint" in manifest["reference"]
+
+    # The observability block is persisted so a resumed run can restore it.
+    config = (runs / "exp1-obs" / "config.yaml").read_text(encoding="utf-8")
+    assert "observability:" in config
+
+
 def test_prepare_and_train_numeric_forecast_run(tmp_path: Path, capsys) -> None:
     dataset, runs = tmp_path / "dataset", tmp_path / "runs"
     write_numeric_bundle(dataset)

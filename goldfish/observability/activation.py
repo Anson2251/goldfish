@@ -339,7 +339,8 @@ def _mean_per_head_ratios(ratios: dict[str, list[tuple[Tensor, Tensor]]]) -> dic
         head_count = values.shape[-1]
         result[key] = []
         for head in range(head_count):
-            valid = values[masks[:, head], head]
+            mask = masks[:, :, head]
+            valid = values[:, :, head][mask]
             result[key].append(float(valid.mean()) if valid.numel() else None)
     return result
 
