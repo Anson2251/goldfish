@@ -1,0 +1,11 @@
+schema_version: 1
+model:
+  family: forecast
+  name: multihead-lstm-latent-communication
+  parameters:
+    hidden_dim: 32
+    num_layers: 2
+    dropout: 0.0
+    num_heads: 4
+    communication_dim: 8
+    communication_gate_initial_logit: -5.0

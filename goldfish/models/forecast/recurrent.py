@@ -6,7 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from goldfish.core import ModelOutput
-from goldfish.models.components import DoublyStochasticMixer, GRUBackbone, LSTMBackbone, UnconstrainedMixer
+from goldfish.models.components import DoublyStochasticMixer, GRUBackbone, HeadLatentCommunication, LSTMBackbone, UnconstrainedMixer
 
 
 class ForecastBatch(Protocol):
@@ -167,6 +167,110 @@ class MultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
             self.mixer = self.mixers[0]
         else:
             self.mixer = DoublyStochasticMixer(num_heads, **mixer_kwargs)
+
+
+class InterLayerCommunicationMultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
+    """Parallel LSTM heads with dense, identity-initialized inter-layer communication."""
+
+    def __init__(
+        self,
+        feature_count: int,
+        target_count: int,
+        horizon_count: int,
+        hidden_dim: int,
+        *,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__(
+            feature_count,
+            target_count,
+            horizon_count,
+            hidden_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.communications = nn.ModuleList(
+            nn.Linear(hidden_dim, hidden_dim)
+            for _ in range(num_layers - 1)
+        )
+        for communication in self.communications:
+            nn.init.eye_(communication.weight)
+            nn.init.zeros_(communication.bias)
+
+    def forward(self, batch: ForecastBatch) -> ModelOutput:
+        if batch.inputs.ndim != 3:
+            raise ValueError("forecast inputs must have shape [batch, lookback, feature_count].")
+        head_states = [normalization(projection(batch.inputs)) for projection, normalization in zip(self.input_projections, self.input_normalizations, strict=True)]
+        num_layers = len(self.head_layers[0])
+        for layer_index in range(num_layers):
+            head_states = [head_layers[layer_index](states)[0] for head_layers, states in zip(self.head_layers, head_states, strict=True)]
+            stacked = torch.stack(head_states, dim=-2)
+            if layer_index + 1 < num_layers:
+                communicated = self.communications[layer_index](stacked.flatten(start_dim=-2))
+                head_states = list(self.dropout(communicated).unflatten(-1, (self.num_heads, self.head_dim)).unbind(dim=-2))
+        representations = self.fusion(stacked.flatten(start_dim=-2))
+        forecast = self.forecast_head(representations[:, -1]).reshape(
+            batch.inputs.shape[0], self.horizon_count, self.target_count
+        )
+        return ModelOutput(predictions={"forecast": forecast}, representations=representations)
+
+
+class LatentCommunicationMultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):
+    """Parallel LSTM heads with gated latent cross-head communication between layers."""
+
+    def __init__(
+        self,
+        feature_count: int,
+        target_count: int,
+        horizon_count: int,
+        hidden_dim: int,
+        *,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        communication_dim: int | None = None,
+        communication_gate_initial_logit: float = -5.0,
+    ) -> None:
+        if num_heads <= 1:
+            raise ValueError("latent communication requires num_heads > 1")
+        super().__init__(
+            feature_count,
+            target_count,
+            horizon_count,
+            hidden_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
+        self.latent_communications = nn.ModuleList(
+            HeadLatentCommunication(
+                num_heads,
+                self.head_dim,
+                communication_dim=communication_dim,
+                gate_initial_logit=communication_gate_initial_logit,
+            )
+            for _ in range(num_layers - 1)
+        )
+
+    def forward(self, batch: ForecastBatch) -> ModelOutput:
+        if batch.inputs.ndim != 3:
+            raise ValueError("forecast inputs must have shape [batch, lookback, feature_count].")
+        head_states = [normalization(projection(batch.inputs)) for projection, normalization in zip(self.input_projections, self.input_normalizations, strict=True)]
+        num_layers = len(self.head_layers[0])
+        for layer_index in range(num_layers):
+            head_states = [head_layers[layer_index](states)[0] for head_layers, states in zip(self.head_layers, head_states, strict=True)]
+            stacked = torch.stack(head_states, dim=-2)
+            if layer_index + 1 < num_layers:
+                communicated = self.latent_communications[layer_index](stacked)
+                head_states = list(self.dropout(communicated).unbind(dim=-2))
+        representations = self.fusion(stacked.flatten(start_dim=-2))
+        forecast = self.forecast_head(representations[:, -1]).reshape(
+            batch.inputs.shape[0], self.horizon_count, self.target_count
+        )
+        return ModelOutput(predictions={"forecast": forecast}, representations=representations)
 
 
 class UnconstrainedMultiHeadLSTMForecastModel(_MultiHeadLSTMForecastModel):

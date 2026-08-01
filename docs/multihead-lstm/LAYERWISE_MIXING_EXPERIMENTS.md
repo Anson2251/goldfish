@@ -388,3 +388,297 @@ This supports the hypothesis that once head specialization has occurred under a 
 4. **"Delayed coupling" remains the leading explanation for the identity-init advantage.** `exp79` allows heads to specialize independently during the critical early phase, then introduces only subtle cross-head routing. `exp81` and `exp80` force coupling before useful head representations exist, and the resulting coupled representations are suboptimal even after 1,000 epochs of further training.
 
 ---
+
+## UPDATE: Distinct per-layer mixers (exp84)
+
+### Setup
+
+`exp84` tests whether the shared mixer in `exp79` is a bottleneck. In `exp79`, the same doubly stochastic matrix is applied after every recurrent layer, including both the layer-1-to-layer-2 boundary and the final layer-to-fusion boundary. `exp84` instead gives every recurrent layer output its own independently learned mixer.
+
+```yaml
+model:
+  family: forecast
+  name: multihead-lstm-distinct
+  parameters:
+    hidden_dim: 32
+    num_heads: 4
+    num_layers: 2
+    dropout: 0.0
+    sinkhorn_iterations: 20
+    mixer_initialization: identity
+    mixer_random_std: 1.0
+    mixer_uniform_ratio: 0.0
+    use_distinct_mixers: true
+```
+
+For `num_layers: 2`, this creates:
+
+```text
+per-head LSTM layer 1
+→ mixer 0 (layer 1 → layer 2)
+→ per-head LSTM layer 2
+→ mixer 1 (layer 2 → fusion)
+→ flatten → LayerNorm → Linear → forecast
+```
+
+Both mixers are independent `4 × 4` doubly stochastic matrices with identity warm starts. The dataset lock, dimensions, optimizer, scheduler, and epoch budget match `exp79`. The run environment records Git commit `949fcdfb5c62b1302410927f36c2150090b28497` and `git_dirty: true`.
+
+### Results
+
+| Run | Mixer structure | Best validation loss | Best epoch | Final validation loss |
+|---|---|---:|---:|---:|
+| `exp73` | Output-only, one constrained mixer | `0.01584` | 961 | `0.01857` |
+| `exp79` | Layerwise, one shared constrained mixer | **`0.00705`** | 913 | **`0.00893`** |
+| `exp84` | Layerwise, two distinct constrained mixers | `0.01714` | 990 | `0.02773` |
+
+`exp84` did not reproduce the shared-mixer result: its best validation loss is `2.4×` higher than `exp79` (`0.00705 → 0.01714`). It is, however, close to the output-only constrained baseline `exp73` (`0.01584`).
+
+The final validation loss is materially above the selected best checkpoint (`0.02773` vs `0.01714`), so comparisons should use best validation loss for model selection and retain final loss as a trajectory observation.
+
+### Training trajectory
+
+| Epoch | `exp79` shared mixer train / validation | `exp84` distinct mixers train / validation |
+|---:|---:|---:|
+| 1 | `1.01938 / 1.60837` | `0.84076 / 1.26471` |
+| 10 | `0.35377 / 0.48669` | `0.33349 / 0.46478` |
+| 20 | `0.23027 / 0.30023` | `0.23313 / 0.30554` |
+| 50 | `0.17252 / 0.20267` | `0.17893 / 0.20772` |
+| 100 | `0.05885 / 0.08763` | `0.05278 / 0.10102` |
+| 250 | `0.01197 / 0.03041` | `0.02463 / 0.03626` |
+| 500 | `0.00604 / 0.01812` | `0.01615 / 0.02861` |
+| 750 | `0.00496 / 0.01850` | `0.01340 / 0.02290` |
+| 1000 | `0.00469 / 0.00893` | `0.01592 / 0.02773` |
+
+The runs are similar through epoch 50. `exp84` then develops a worse validation trajectory: at epoch 100 it has lower training loss but higher validation loss, and it remains behind `exp79` through both cosine cycles. At its best epoch 990, `exp84` reaches train / validation `0.01567 / 0.01714`; its train-validation gap is small at that selected checkpoint, so the main difference from `exp79` is not a large late train/validation split but a higher achievable loss floor.
+
+### Mixer inspection
+
+The best checkpoint contains two independent near-identity matrices:
+
+```text
+P_exp84_layer_1_to_2 =
+[[0.999890, 0.000046, 0.000062, 0.000018],
+ [0.000038, 0.999876, 0.000044, 0.000042],
+ [0.000034, 0.000038, 0.999860, 0.000036],
+ [0.000039, 0.000040, 0.000034, 0.999903]]
+
+P_exp84_layer_2_to_fusion =
+[[0.999896, 0.000070, 0.000062, 0.000072],
+ [0.000039, 0.999843, 0.000050, 0.000051],
+ [0.000031, 0.000045, 0.999844, 0.000046],
+ [0.000034, 0.000042, 0.000043, 0.999831]]
+```
+
+| Mixer | `||P - I||_F` | `||P - I||_2` | `max(abs(P - I))` | Total off-diagonal mass | Diagonal range |
+|---|---:|---:|---:|---:|---:|
+| `exp79` shared final | `2.62e-4` | `1.77e-4` | `1.39e-4` | `4.43e-4` | `[0.999861, 0.999927]` |
+| `exp84` layer 1 → layer 2 | `2.76e-4` | `1.80e-4` | `1.40e-4` | `4.72e-4` | `[0.999860, 0.999903]` |
+| `exp84` layer 2 → fusion | `3.45e-4` | `2.11e-4` | `1.69e-4` | `5.86e-4` | `[0.999831, 0.999896]` |
+
+Both distinct mixers remain near identity. The final-output mixer has approximately 24% more off-diagonal mass than the inter-layer mixer (`5.86e-4` vs `4.72e-4`), which is directionally consistent with allowing slightly more final fusion than recurrent-state communication. The absolute difference is still very small.
+
+The final checkpoint shows essentially the same matrices as the best checkpoint, so the late validation degradation is not accompanied by a material mixer change.
+
+### Interpretation
+
+1. **This run does not support the shared-mixer bottleneck hypothesis.** Giving the two positions independent matrices did not produce substantial layer-specific routing and did not improve validation performance. Both matrices selected near-identity routing.
+
+2. **Shared parameters may be a useful regularizer or optimization aid.** `exp84` adds only one extra `4 × 4` logit matrix, but it has a higher loss floor than `exp79`. One interpretation is that requiring the same near-identity routing at both positions reduces degrees of freedom in a beneficial way. This is a single-run observation, not a general conclusion.
+
+3. **Separate matrices alone do not solve the feature-space problem.** Each mixer still combines matching coordinates across independently parameterized heads. If those coordinates are not semantically aligned, making the matrices position-specific cannot create the missing cross-feature translation mechanism.
+
+4. **The result motivates dense latent communication rather than further coordinate-wise mixer variants.** A layerwise `Linear(hidden_dim, hidden_dim)` communication block can map any source-head feature to any destination-head feature while preserving a strict identity initialization. This is implemented as the separate `multihead-lstm-communication` model and should be evaluated independently of `exp84`.
+
+---
+
+## UPDATE: Dense inter-layer communication (exp86)
+
+### Setup
+
+`exp86` replaces coordinate-wise head mixing with a dense identity-initialized communication transform at each true layer boundary. For the current `hidden_dim: 32`, `num_heads: 4`, and `head_dim: 8` configuration, it applies:
+
+```text
+per-head LSTM layer 1
+→ stack: [B, T, 4, 8]
+→ flatten: [B, T, 32]
+→ Linear(32, 32), initialized as W = I and b = 0
+→ reshape: [B, T, 4, 8]
+→ per-head LSTM layer 2
+→ flatten → existing LayerNorm + Linear fusion → forecast
+```
+
+There is no doubly stochastic mixer and no extra final-output communication transform. The dense transform exists only at real layer boundaries; a one-layer model would have none. This makes the communication block initially an exact identity while allowing any source-head feature to influence any destination-head feature during training.
+
+```yaml
+model:
+  family: forecast
+  name: multihead-lstm-communication
+  parameters:
+    hidden_dim: 32
+    num_heads: 4
+    num_layers: 2
+    dropout: 0.0
+```
+
+The dataset and normalizer fingerprints, split fingerprints, optimizer, scheduler, and epoch budget match the preceding experiments. The run environment records Git commit `f5b72036d0c909d44c92fb52f5055fa27b52815e` and `git_dirty: true`.
+
+### Results
+
+| Run | Inter-layer mechanism | Best validation loss | Best epoch | Final validation loss |
+|---|---|---:|---:|---:|
+| `exp79` | Shared doubly stochastic coordinate mixer | **`0.00705`** | 913 | **`0.00893`** |
+| `exp73` | No inter-layer communication; output-only constrained mixer | `0.01584` | 961 | `0.01857` |
+| `exp84` | Distinct doubly stochastic coordinate mixers | `0.01714` | 990 | `0.02773` |
+| `exp86` | Dense identity-init `Linear(32, 32)` | `0.02003` | 995 | `0.02349` |
+
+`exp86` is stable and substantially better than the random/uniform coordinate-mixing ablations, but it does not exceed the constrained output-only baseline: its best validation loss is `1.26×` `exp73` (`0.01584 → 0.02003`).
+
+### Training trajectory
+
+| Epoch | `exp73` output-only | `exp79` shared mixer | `exp86` dense communication |
+|---:|---:|---:|---:|
+| 1 | `0.92322 / 1.88706` | `1.01938 / 1.60837` | `0.93266 / 1.68291` |
+| 10 | `0.28866 / 0.42223` | `0.35377 / 0.48669` | `0.27066 / 0.37800` |
+| 20 | `0.23186 / 0.30205` | `0.23027 / 0.30023` | `0.22059 / 0.26535` |
+| 50 | `0.19329 / 0.23532` | `0.17252 / 0.20267` | `0.12169 / 0.18595` |
+| 100 | `0.07679 / 0.09971` | `0.05885 / 0.08763` | `0.06846 / 0.09383` |
+| 250 | `0.03399 / 0.05075` | `0.01197 / 0.03041` | `0.03125 / 0.04433` |
+| 500 | `0.02239 / 0.03279` | `0.00604 / 0.01812` | `0.02282 / 0.03546` |
+| 750 | `0.01782 / 0.02658` | `0.00496 / 0.01850` | `0.02119 / 0.02846` |
+| 1000 | `0.01646 / 0.01857` | `0.00469 / 0.00893` | `0.01399 / 0.02349` |
+
+Dense communication is initially competitive: through epoch 250 it has lower validation loss than `exp73`. It does not sustain that advantage through the cosine cycles, finishing with lower train loss but higher validation loss than `exp73`.
+
+### Communication inspection
+
+Unlike the previous mixers, the final communication matrix is strongly non-identity:
+
+| Checkpoint | `||W - I||_F` | `||W - I||_2` | `max(abs(W - I))` | `||b||_2` |
+|---|---:|---:|---:|---:|
+| best (epoch 995) | `2.4334` | `1.9296` | `0.5379` | `0.2162` |
+| final (epoch 1000) | `2.4360` | `1.9311` | `0.5389` | `0.2163` |
+
+Partitioning the final `32 × 32` matrix into `4 × 4` blocks of size `8 × 8`, the following are Frobenius norms. Diagonal entries are `||W_ii - I||_F`; off-diagonal entries are `||W_ij||_F`, with rows indexing destination heads and columns source heads:
+
+```text
+[[0.524, 0.530, 0.646, 0.502],
+ [0.460, 0.520, 0.646, 0.525],
+ [0.526, 0.508, 0.627, 0.480],
+ [0.702, 1.043, 0.756, 0.471]]
+```
+
+The mean cross-head block norm is `0.610`, larger than the mean head-local deviation from identity (`0.536`). Thus the model did not merely reparameterize individual heads: it learned substantial cross-head, cross-feature transforms. Best and final matrices are nearly unchanged, so this topology stabilizes before the end of training.
+
+### Interpretation
+
+1. **The model can and does learn strong cross-head communication when unconstrained dense feature mixing is available.** The near-identity outcome of the doubly stochastic `P` matrices therefore does not establish that the task rejects all communication.
+
+2. **Strong communication alone is not sufficient for good validation performance.** `exp86` learns substantial non-identity cross-head blocks but has a worse final validation floor than `exp73` and is far from `exp79`. The dense transform is likely too unconstrained: it can mix, rescale, rotate, and bias local and cross-head features simultaneously.
+
+3. **Feature translation remains a useful motivation, but dense mixing confounds translation with routing and local reparameterization.** The next model should separate source-head translation, head-level routing, destination-head decoding, and total communication strength.
+
+---
+
+## UPDATE: Gated latent head communication (exp87)
+
+### Setup
+
+`exp87` separates feature translation from head routing. At the layer-1-to-layer-2 boundary, each source head maps its local state to a communication latent through a head-specific MLP. Each destination head uses a static masked-softmax distribution over the *other* source heads, decodes the resulting latent message through its own MLP, and injects it as a small residual update.
+
+```text
+source head state h_j
+→ source-specific encoder E_j
+→ latent z_j
+→ receiver-specific masked-softmax routing α[i ← j], with j != i
+→ destination message m_i
+→ destination-specific decoder D_i
+→ h_i + sigmoid(g_i) ⊙ D_i(m_i)
+→ LSTM layer 2
+```
+
+```yaml
+model:
+  family: forecast
+  name: multihead-lstm-latent-communication
+  parameters:
+    hidden_dim: 32
+    num_heads: 4
+    num_layers: 2
+    dropout: 0.0
+    communication_dim: 8
+    communication_gate_initial_logit: -5.0
+```
+
+Self-routes are masked. Initial routing is uniform over the other three heads, and `sigmoid(-5) ≈ 0.00669` makes initial message injection small but nonzero, preserving gradient flow to encoders, decoders, gates, and routing logits. No doubly stochastic matrix is used. Dataset, normalizer, split locks, optimizer, scheduler, epoch budget, and run environment match `exp86`.
+
+### Results
+
+| Run | Communication mechanism | Best validation loss | Best epoch | Final validation loss |
+|---|---|---:|---:|---:|
+| `exp79` | Shared doubly stochastic coordinate mixer | **`0.00705`** | 913 | **`0.00893`** |
+| `exp78` | Single LSTM, width 20 | `0.00772` | 958 | `0.00929` |
+| `exp87` | Latent translation + masked-softmax routing + gated residual | `0.01089` | 945 | `0.01223` |
+| `exp73` | Output-only constrained mixer | `0.01584` | 961 | `0.01857` |
+| `exp86` | Dense inter-layer communication | `0.02003` | 995 | `0.02349` |
+
+Relative to `exp73`, `exp87` reduces best validation loss by `31.2%` (`0.01584 → 0.01089`). It also improves over dense communication `exp86` by `45.6%` (`0.02003 → 0.01089`). It remains `1.55×` above `exp79` and `1.41×` above the single-LSTM reference on this one trajectory.
+
+### Training trajectory
+
+| Epoch | `exp73` output-only | `exp79` shared mixer | `exp86` dense communication | `exp87` latent communication |
+|---:|---:|---:|---:|---:|
+| 1 | `0.92322 / 1.88706` | `1.01938 / 1.60837` | `0.93266 / 1.68291` | `0.94522 / 1.77485` |
+| 10 | `0.28866 / 0.42223` | `0.35377 / 0.48669` | `0.27066 / 0.37800` | `0.36422 / 0.48531` |
+| 20 | `0.23186 / 0.30205` | `0.23027 / 0.30023` | `0.22059 / 0.26535` | `0.23548 / 0.29458` |
+| 50 | `0.19329 / 0.23532` | `0.17252 / 0.20267` | `0.12169 / 0.18595` | `0.19971 / 0.22616` |
+| 100 | `0.07679 / 0.09971` | `0.05885 / 0.08763` | `0.06846 / 0.09383` | `0.09077 / 0.11932` |
+| 250 | `0.03399 / 0.05075` | `0.01197 / 0.03041` | `0.03125 / 0.04433` | `0.02764 / 0.04636` |
+| 500 | `0.02239 / 0.03279` | `0.00604 / 0.01812` | `0.02282 / 0.03546` | `0.01587 / 0.02759` |
+| 750 | `0.01782 / 0.02658` | `0.00496 / 0.01850` | `0.02119 / 0.02846` | `0.01202 / 0.02114` |
+| 1000 | `0.01646 / 0.01857` | `0.00469 / 0.00893` | `0.01399 / 0.02349` | `0.01267 / 0.01223` |
+
+`exp87` does not win early: it remains behind `exp73` at epoch 100 and is close at epoch 250. Its main advantage emerges in the second cosine cycle, where it continues improving from `0.02759` at epoch 500 to `0.01223` at epoch 1000. This contrasts with `exp86`, whose early advantage does not translate to a lower final validation floor.
+
+### Routing and gate inspection
+
+The best checkpoint at epoch 945 learns the following receiver-by-source routing matrix; rows are destination heads, columns source heads, and self-routes are masked to zero:
+
+```text
+α_exp87 =
+[[0.000000, 0.221056, 0.530484, 0.248459],
+ [0.217126, 0.000000, 0.605853, 0.177021],
+ [0.315508, 0.339333, 0.000000, 0.345159],
+ [0.226404, 0.274482, 0.499114, 0.000000]]
+```
+
+The final checkpoint changes this only slightly:
+
+```text
+α_exp87_final =
+[[0.000000, 0.212096, 0.544039, 0.243865],
+ [0.210677, 0.000000, 0.616334, 0.172989],
+ [0.314989, 0.339954, 0.000000, 0.345057],
+ [0.220428, 0.273329, 0.506244, 0.000000]]
+```
+
+Three receivers (heads 0, 1, and 3) primarily route from head 2, with maximum source weights `0.53`, `0.61`, and `0.50`; head 2 remains near-uniform over the remaining heads. Head indices do not have prespecified semantic meanings, so this is evidence of a stable asymmetric communication topology, not an identification of a particular frequency role.
+
+| Gate statistic | Initial | Best checkpoint | Final checkpoint |
+|---|---:|---:|---:|
+| Minimum | `0.00669` | `0.00614` | `0.00614` |
+| Mean | `0.00669` | `0.00728` | `0.00733` |
+| Maximum | `0.00669` | `0.00952` | `0.00950` |
+
+The routing logits become clearly non-uniform, whereas gates remain small. This supports conservative, receiver-selective message injection. A small gate alone does not bound the actual message magnitude because decoders may rescale messages; direct measurement of `||gate ⊙ D(m)|| / ||h||` requires the planned probe system.
+
+### Interpretation
+
+1. **Head communication is useful when feature translation, routing, and message injection are separated.** `exp87` substantially improves over output-only mixing and dense unconstrained communication, while learning an explicit stable routing graph.
+
+2. **Receiver-selective routing avoids a limitation of doubly stochastic head mixing.** A useful source head may broadcast to multiple destinations: head 2 is the dominant source for three receivers. Column-stochastic mass conservation would restrict this pattern.
+
+3. **The small residual gate is a plausible regularizer.** In contrast to the strongly non-identity dense transform in `exp86`, `exp87` preserves a small communication injection while allowing encoders and decoders to learn feature translation. This is consistent with its better second-cycle validation trajectory, but does not establish causality.
+
+4. **`exp79` remains unexplained.** The latent design is more expressive and produces directly observable communication, but it does not reproduce the shared near-identity mixer's `0.00705` result. One seed per condition remains a material confound.
+
+---

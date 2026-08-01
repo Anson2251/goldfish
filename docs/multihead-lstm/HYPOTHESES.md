@@ -1,6 +1,6 @@
 # Multi-Head LSTM Mixer: Working Hypotheses
 
-This document records the explanatory hypotheses generated during the layerwise-mixer ablation sequence (exp73–exp81). Each hypothesis is stated, linked to the evidence that supports or contradicts it, and tagged with its current epistemic status and the experiments needed to validate or falsify it.
+This document records the explanatory hypotheses generated during the multi-head LSTM communication ablation sequence (exp73–exp87). Each hypothesis is stated, linked to evidence that supports or contradicts it, and tagged with its current epistemic status and the experiments needed to validate or falsify it.
 
 ---
 
@@ -14,9 +14,10 @@ This document records the explanatory hypotheses generated during the layerwise-
 - `exp79` final mixer ≈ identity but performance ≫ `exp73` output-only.
 - `exp80` random init learns a stable non-identity mixer but performs poorly; the model does not spontaneously recover identity-like routing.
 - `exp81` uniform 0.3 starts at `diag=0.7` and moves only to `diag≈0.74`; if forward routing were the only mechanism, one would expect stronger movement toward identity given the large performance penalty.
+- `exp87` learns non-uniform routing while retaining small residual gates, showing that explicit forward routing can coexist with conservative state injection. It does not by itself establish whether the gain is forward-message, gradient-path, or joint-training driven.
 
 **Contradictions / open questions:**
-- If gradient coupling is the key mechanism, freezing the mixer to `M=I` after epoch N should cause performance to collapse when N is small but remain stable when N is large. No such experiment has been run.
+- If gradient coupling is the key mechanism, freezing the mixer or communication block after epoch N should cause performance to collapse when N is small but remain stable when N is large. No such experiment has been run.
 
 **Status:** Plausible, not directly tested.
 
@@ -36,11 +37,12 @@ This document records the explanatory hypotheses generated during the layerwise-
 - `exp80` and `exp81` both show worse validation than `exp79` from epoch 1.
 - `exp81` outperforms `exp79` at epoch 50 (val `0.175` vs `0.203`), suggesting moderate early coupling can act as regularization, but the ceiling is lower.
 - Final `exp81` mixer has only moved 13% toward identity from its initialization, suggesting the model cannot undo the early coupling structure.
+- `exp87` begins with uniform routing over non-self sources, but its residual gate is only `sigmoid(-5) ≈ 0.0067`. Its eventual improvement over `exp73` shows that a uniform *routing topology* is not necessarily harmful when the actual injected message is initially small.
 
 **Contradictions / open questions:**
-- `exp81` early advantage contradicts the stronger version of this hypothesis ("any early coupling is harmful"). The effect appears to be *dose-dependent* rather than binary.
+- `exp81` early advantage contradicts the stronger version of this hypothesis ("any early coupling is harmful"). The evidence now distinguishes routing distribution from total injection magnitude: the harmful variable may be large early injected messages, not non-identity routing alone.
 
-**Status:** Partially supported; needs refinement to account for the non-monotonic early/late trade-off.
+**Status:** Partially supported; revised to focus on early communication magnitude rather than routing topology alone.
 
 **Validation experiments:**
 1. Scheduled mixer initialization: start with `M=I` for first N epochs, then switch to learnable. If delayed coupling recovers `exp79`-level performance, the hypothesis is strongly supported.
@@ -116,22 +118,14 @@ This document records the explanatory hypotheses generated during the layerwise-
 
 ## 6. Shared-mixer constraint hypothesis
 
-**Statement:** The current architecture uses a *single* mixer matrix that is applied at every layer boundary and also at the final output. This forces the model to find one routing pattern that must simultaneously serve two potentially different needs: (a) cross-head communication before the next recurrent layer, and (b) head fusion before the forecast head. Near-identity convergence may be a *compromise* because it is the only configuration that is not strongly suboptimal for either role.
+**Statement:** The shared mixer may have forced a compromise between layer-boundary communication and final fusion, causing near-identity convergence.
 
-**Rationale:** Layer 1→2 mixer influences recurrent state updates; layer 2→fusion mixer determines how independent features are combined for prediction. If these two roles need different cross-head patterns, sharing one matrix imposes a strong constraint. Identity is the "safe" default that minimally harms either role.
+**Evidence against:**
+- `exp84` directly tested this by using distinct matrices for layer 1→2 and layer 2→fusion.
+- Both matrices remained near identity; the final mixer had slightly more off-diagonal mass, but neither learned substantial routing.
+- `exp84` best validation loss (`0.01714`) was materially worse than shared-mixer `exp79` (`0.00705`).
 
-**Evidence:**
-- Indirect: both `exp73` (output-only) and `exp79` (layerwise) converge to near-identity, suggesting the model does not find a strong non-identity routing useful anywhere.
-- `exp81` and `exp80` do learn non-identity routing, but only when forced by initialization; this suggests non-identity routing is *learnable* but not *beneficial* under the shared-matrix constraint.
-
-**Contradictions / open questions:**
-- If this hypothesis is true, allowing two independent mixers should enable richer routing and potentially better performance.
-
-**Status:** Novel hypothesis; no direct evidence yet.
-
-**Validation experiments:**
-1. Dual-mixer architecture: `P_inter` (between layers) and `P_final` (before fusion) as independent learned matrices. If one deviates from identity while the other stays near identity, the hypothesis is confirmed.
-2. If dual-mixer outperforms `exp79`, the shared-matrix design is a bottleneck.
+**Status:** Weakened by direct evidence. Shared-mixer tying is not established as a bottleneck; it may instead be a useful regularizer or a favorable optimization constraint. This conclusion remains limited to one trajectory.
 
 ---
 
@@ -145,11 +139,12 @@ This document records the explanatory hypotheses generated during the layerwise-
 - `exp73` uses `nn.LSTM(..., num_layers=2)` per head.
 - `exp79` uses `nn.ModuleList([nn.LSTM(..., num_layers=1), nn.LSTM(..., num_layers=1)])` per head.
 - PyTorch's native multi-layer LSTM applies dropout between layers internally and uses a fused backward path; the stacked version does not.
+- `exp84`, `exp86`, and `exp87` all also use explicit stacked one-layer LSTMs but do not reproduce `exp79`. This weakens the claim that stacking alone is sufficient, but it does not isolate stacking because their communication mechanisms differ.
 
 **Contradictions / open questions:**
 - If the LSTM implementation change explains the gain, then a single-head layerwise model without any mixer should also perform well.
 
-**Status:** Unresolved; competes with "mixer is the key" explanations.
+**Status:** Still unresolved, but stacking alone is unlikely to explain all of `exp79`.
 
 **Validation experiments:**
 1. `num_heads=1, head_dim=32` layerwise LSTM with no mixer (or fixed `M=I` acting as pure identity). If performance ≈ `exp79`, the gain is mostly from stacked-single-layer implementation.
@@ -213,27 +208,50 @@ This document records the explanatory hypotheses generated during the layerwise-
 
 ---
 
+## 11. Translate-route-decode hypothesis
+
+**Statement:** Cross-head communication is more useful when three responsibilities are separated: source-local feature translation, receiver-selective head routing, and destination-local decoding. Communication should be injected conservatively through a residual gate.
+
+**Evidence:**
+- `exp86` learns strong, directly mixed cross-feature communication but finishes at `0.02003` best validation loss.
+- `exp87` uses head-specific encoders/decoders, masked-softmax receiver routing, and small residual gates; it improves to `0.01089`.
+- `exp87` learns stable non-uniform routing, including a source head selected by three receivers, while maintaining small gates.
+
+**Contradictions / open questions:**
+- `exp87` is more expressive and uses many more parameters than the constrained coordinate mixer, so its improvement over `exp73` cannot be attributed solely to translation/routing separation.
+- It still does not match `exp79`; the mechanism of the latter remains unresolved.
+
+**Status:** Supported by one trajectory as a promising design direction; not a causal conclusion.
+
+**Validation experiments:**
+1. Fixed-uniform routing with learned encoders/decoders and gates, to isolate whether learned routing helps.
+2. Linear encoder/decoder variant, to isolate whether MLP nonlinearity helps.
+3. Gate-init sweep (`-6`, `-5`, `-4`) with a common seed set, to test delayed-message strength.
+
+---
+
 ## Summary Table
 
 | # | Hypothesis | Status | Key Missing Experiment |
 |---|---|---|---|
-| 1 | Gradient-channel | Plausible | Freeze mixer at epoch N |
-| 2 | Premature bottleneck | Partially supported | Scheduled coupling (delay N epochs) |
-| 3 | Continuous landscape | Supported (coarse) | Uniform ratio sweep `0.01–0.2` |
+| 1 | Gradient-channel | Plausible | Freeze communication at epoch N |
+| 2 | Premature bottleneck | Partially supported, revised | Gate-init / scheduled-message sweep |
+| 3 | Continuous coordinate-mixer landscape | Supported (coarse) | Uniform ratio sweep `0.01–0.2` |
 | 4 | Representation-locking | Strongly supported | Mixer reset at mid-training |
-| 5 | Delayed coupling | Highly plausible, unverified | Intermediate mixer trajectory |
-| 6 | Shared-mixer constraint | Novel | Dual-mixer architecture |
-| 7 | Single-layer stacking | Unresolved | `num_heads=1` layerwise baseline |
-| 8 | Learnability-as-freedom | Needs test | `M=I` fixed control |
-| 9 | Residual regularization | Speculative | Gradient magnitude analysis |
+| 5 | Delayed coupling | Highly plausible, unverified | Intermediate `exp79` mixer trajectory |
+| 6 | Shared-mixer constraint | Weakened by `exp84` | Multi-seed shared vs distinct comparison |
+| 7 | Single-layer stacking | Unresolved; insufficient alone | `num_heads=1` layerwise baseline |
+| 8 | Learnability-as-freedom | Needs test | Fixed-identity control |
+| 9 | Residual regularization | Speculative | Gradient/message magnitude analysis |
 | 10 | Seed variation | Acknowledged | Multi-seed sweep |
+| 11 | Translate-route-decode | Promising, one trajectory | Routing / gate / MLP ablations |
 
 ---
 
 ## Recommended priority order for next experiments
 
-1. **Intermediate mixer trajectory** for `exp79` (retrospective or re-run) — tests hypothesis 5.
-2. **Dual-mixer architecture** — tests hypothesis 6 and may yield a new best architecture.
-3. **`num_heads=1` layerwise + fixed `M=I`** — isolates hypothesis 7 from all mixer-related hypotheses.
-4. **Uniform ratio sweep (`0.01`, `0.05`, `0.1`)** — tests hypothesis 3 and maps the dose-response curve.
-5. **Multi-seed sweep** for `exp79` and `exp78` — tests hypothesis 10 and hardens the comparison to single LSTM.
+1. **Implement the planned probe system for communication residual magnitude** — record `||gate ⊙ D(m)|| / ||h||`, routing, and gates through training.
+2. **Seed sweep for `exp79`, `exp78`, `exp73`, and `exp87`** — establish which reported gaps are stable.
+3. **Fixed-uniform-routing latent communication** — isolate learned receiver routing from source/destination MLP capacity.
+4. **`num_heads=1` layerwise baseline** — isolate explicit stacked-LSTM effects.
+5. **Intermediate mixer trajectory for `exp79`** — determine whether its final near-identity state hides meaningful training-time excursions.

@@ -34,6 +34,56 @@ class _ForecastSummaryModel(nn.Module):
         if hasattr(self.model, "backbone") and hasattr(self.model, "forecast_head"):
             states, _ = self.model.backbone(inputs)  # type: ignore[attr-defined]
             return self.model.forecast_head(states[:, -1])  # type: ignore[attr-defined]
+        if all(hasattr(self.model, name) for name in ("input_projections", "input_normalizations", "head_layers", "latent_communications", "fusion", "forecast_head")):
+            head_states = [
+                normalization(projection(inputs))
+                for projection, normalization in zip(
+                    self.model.input_projections,  # type: ignore[attr-defined]
+                    self.model.input_normalizations,  # type: ignore[attr-defined]
+                    strict=True,
+                )
+            ]
+            num_layers = len(self.model.head_layers[0])  # type: ignore[attr-defined]
+            for layer_index in range(num_layers):
+                head_states = [
+                    head_layers[layer_index](states)[0]
+                    for head_layers, states in zip(
+                        self.model.head_layers,  # type: ignore[attr-defined]
+                        head_states,
+                        strict=True,
+                    )
+                ]
+                stacked = torch.stack(head_states, dim=-2)
+                if layer_index + 1 < num_layers:
+                    communicated = self.model.latent_communications[layer_index](stacked)  # type: ignore[attr-defined]
+                    head_states = list(communicated.unbind(dim=-2))
+            representations = self.model.fusion(stacked.flatten(start_dim=-2))  # type: ignore[attr-defined]
+            return self.model.forecast_head(representations[:, -1])  # type: ignore[attr-defined]
+        if all(hasattr(self.model, name) for name in ("input_projections", "input_normalizations", "head_layers", "communications", "fusion", "forecast_head")):
+            head_states = [
+                normalization(projection(inputs))
+                for projection, normalization in zip(
+                    self.model.input_projections,  # type: ignore[attr-defined]
+                    self.model.input_normalizations,  # type: ignore[attr-defined]
+                    strict=True,
+                )
+            ]
+            num_layers = len(self.model.head_layers[0])  # type: ignore[attr-defined]
+            for layer_index in range(num_layers):
+                head_states = [
+                    head_layers[layer_index](states)[0]
+                    for head_layers, states in zip(
+                        self.model.head_layers,  # type: ignore[attr-defined]
+                        head_states,
+                        strict=True,
+                    )
+                ]
+                stacked = torch.stack(head_states, dim=-2)
+                if layer_index + 1 < num_layers:
+                    communicated = self.model.communications[layer_index](stacked.flatten(start_dim=-2))  # type: ignore[attr-defined]
+                    head_states = list(communicated.unflatten(-1, (self.model.num_heads, self.model.head_dim)).unbind(dim=-2))  # type: ignore[attr-defined]
+            representations = self.model.fusion(stacked.flatten(start_dim=-2))  # type: ignore[attr-defined]
+            return self.model.forecast_head(representations[:, -1])  # type: ignore[attr-defined]
         if all(hasattr(self.model, name) for name in ("input_projections", "input_normalizations", "head_layers", "mixer", "fusion", "forecast_head")):
             head_states = [
                 normalization(projection(inputs))

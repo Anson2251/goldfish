@@ -1,7 +1,7 @@
 """Model components and modality-specific model compositions."""
 
 from .components import DoublyStochasticMixer, GRUBackbone, LSTMBackbone, RecurrentState, UnconstrainedMixer
-from .forecast import GRUForecastModel, LSTMForecastModel, MultiHeadLSTMForecastModel, UnconstrainedMultiHeadLSTMForecastModel
+from .forecast import GRUForecastModel, InterLayerCommunicationMultiHeadLSTMForecastModel, LSTMForecastModel, LatentCommunicationMultiHeadLSTMForecastModel, MultiHeadLSTMForecastModel, UnconstrainedMultiHeadLSTMForecastModel
 from .language import GRULanguageModel, LSTMLanguageModel, TokenBatch
 from .registry import ModelRegistry, model_registry
 
@@ -14,6 +14,8 @@ model_registry.register("forecast", "lstm-128x2", LSTMForecastModel)
 model_registry.register("forecast", "multihead-lstm", MultiHeadLSTMForecastModel)
 model_registry.register("forecast", "multihead-lstm-unconstrained", UnconstrainedMultiHeadLSTMForecastModel)
 model_registry.register("forecast", "multihead-lstm-distinct", MultiHeadLSTMForecastModel)
+model_registry.register("forecast", "multihead-lstm-communication", InterLayerCommunicationMultiHeadLSTMForecastModel)
+model_registry.register("forecast", "multihead-lstm-latent-communication", LatentCommunicationMultiHeadLSTMForecastModel)
 
 __all__ = [
     "DoublyStochasticMixer",
@@ -21,6 +23,8 @@ __all__ = [
     "GRUBackbone",
     "GRULanguageModel",
     "GRUForecastModel",
+    "InterLayerCommunicationMultiHeadLSTMForecastModel",
+    "LatentCommunicationMultiHeadLSTMForecastModel",
     "LSTMBackbone",
     "LSTMForecastModel",
     "LSTMLanguageModel",
