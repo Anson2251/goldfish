@@ -7,3 +7,14 @@ model:
     num_layers: 2
     dropout: 0.0
     num_heads: 4
+observability:
+  probes:
+    - name: communication-state
+      include: ["communications.*"]
+      every_n_epochs: 1
+      include_grad_norms: true
+      head_dim: 8
+    - name: activation-stats
+      points:
+        - {path: "communications.*", quantity: "dense-displacement"}
+      every_n_epochs: 1

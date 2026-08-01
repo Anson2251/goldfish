@@ -32,7 +32,10 @@ def load_model_profile(path: Path) -> dict[str, Any]:
         raise ValueError("Model profile name must be a non-empty string")
     if not isinstance(parameters, Mapping):
         raise ValueError("Model profile parameters must be a mapping")
-    return {"family": family, "name": name, "parameters": dict(parameters)}
+    resolved = {"family": family, "name": name, "parameters": dict(parameters)}
+    if "observability" in value:
+        resolved["observability"] = value["observability"]
+    return resolved
 
 
 def resolve_model_config(profile: Mapping[str, Any], *, family: str, runtime_parameters: Mapping[str, Any]) -> dict[str, Any]:

@@ -9,3 +9,15 @@ model:
     num_heads: 4
     communication_dim: 8
     communication_gate_initial_logit: -5.0
+observability:
+  probes:
+    - name: communication-state
+      include: ["latent_communications.*"]
+      every_n_epochs: 1
+      include_grad_norms: true
+      head_dim: 8
+    - name: activation-stats
+      points:
+        - {path: "latent_communications.*", quantity: "message-magnitude"}
+        - {path: "fusion", quantity: "io-stats"}
+      every_n_epochs: 1
