@@ -9,6 +9,7 @@ For the architecture and data contracts, see:
 - [`docs/TASKS.md`](docs/TASKS.md)
 - [`docs/MODELS.md`](docs/MODELS.md)
 - [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md)
+- [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md)
 
 ## Quick start
 
@@ -64,7 +65,11 @@ runs/exp1-alphabet-gru/
 │   ├── best.pt
 │   └── final.pt
 └── artifacts/
-    └── samples/
+    ├── samples/
+    └── probes/          # Present when --observability is enabled
+        ├── manifest.json
+        ├── mixer-state.jsonl
+        └── activation-stats.jsonl
 ```
 
 ## Dataset workflow
@@ -280,6 +285,31 @@ Useful options:
 | `--max-new-tokens` | `100` | Number of tokens generated after the prompt. |
 
 `best.pt` currently monitors `validation/loss` with `min` mode. The full monitor policy is saved in each run's resolved `config.yaml`.
+
+### Observability
+
+`--observability` enables probe-based state trajectories for a run. Probes are declared by the **model profile** (its `observability.probes` block), so a run only enables the system and configures the reference input set:
+
+```sh
+uv run goldfish train data/fourier-lb256 \
+  --model-profile model-profiles/forecast/multihead-lstm-small.yaml \
+  --observability --observability-batches 8
+```
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--observability` | off | Enable the probes declared by the model profile. |
+| `--observability-batches` | `8` | Reference batches captured from the validation split for activation probes. |
+
+Three probe kinds exist (see [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the full specification):
+
+- `mixer-state` — doubly stochastic / unconstrained mixing matrices, logits, identity distances, and gradient-norm snapshots at every sampled epoch;
+- `communication-state` — dense inter-layer blocks and gated latent communication (routing, gates, block norms);
+- `activation-stats` — statistics of intermediate tensors (norms, mean-abs, std, max, p95) on a fixed reference forward pass, including per-head reductions and composite quantities such as the injected message magnitude `||gate ⊙ D(m)|| / ||h||`.
+
+Records are written as append-only JSONL under `artifacts/probes/`, one file per probe, with a `manifest.json` that records the resolved configuration, matched modules, and the reference split fingerprint for reproducibility. Schedules are configurable per probe (every-N-epochs or explicit epoch lists, plus initial/final records); dense sampling of the early phase is recommended for trajectory questions. The `observability` block is persisted in `config.yaml` and restored on resume.
+
+For example, the `multihead-lstm-small*.yaml` profiles declare the probes appropriate to their model family, so the same command works for the mixer, dense-communication, and latent-communication variants.
 
 ### Strict resume
 
