@@ -13,6 +13,7 @@ from torch.optim import Optimizer
 from tqdm.auto import tqdm
 
 from goldfish.core import Batch, ModelOutput, Task
+from goldfish.observability.events import HookContext, TrainingHook
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ class Trainer(Generic[BatchT]):
         gradient_clip_norm: float | None = None,
         aux_loss_weights: Mapping[str, float] | None = None,
         progress: bool = True,
+        hooks: Sequence[TrainingHook] = (),
     ) -> None:
         if gradient_clip_norm is not None and gradient_clip_norm <= 0:
             raise ValueError("gradient_clip_norm must be positive")
@@ -102,6 +104,7 @@ class Trainer(Generic[BatchT]):
         self.gradient_clip_norm = gradient_clip_norm
         self.aux_loss_weights = dict(aux_loss_weights or {})
         self.progress = progress
+        self.hooks = tuple(hooks)
         self.epoch = -1
         self.global_step = 0
         self._display_final_epoch: int | None = None
@@ -159,6 +162,8 @@ class Trainer(Generic[BatchT]):
 
         history: list[EpochResult] = []
         self._display_final_epoch = self.epoch + epochs + 1
+        for hook in self.hooks:
+            hook.on_fit_start(self._hook_context(phase="fit_start"))
         for _ in range(epochs):
             self.epoch += 1
             train = self.train_epoch(train_loader)
@@ -175,8 +180,13 @@ class Trainer(Generic[BatchT]):
                 self.learning_rates,
             )
             history.append(epoch_result)
+            for hook in self.hooks:
+                hook.on_epoch_end(self._hook_context(phase="epoch_end", epoch=self.epoch, result=epoch_result))
             if self.on_epoch_end is not None:
                 self.on_epoch_end(epoch_result)
+        final_result = history[-1] if history else None
+        for hook in self.hooks:
+            hook.on_fit_end(self._hook_context(phase="fit_end", epoch=self.epoch, result=final_result))
         return FitResult(history, self.epoch, self.global_step)
 
     def save_checkpoint(self, path: str | Path) -> None:
@@ -237,6 +247,18 @@ class Trainer(Generic[BatchT]):
         if metric_name not in validation:
             raise KeyError(f"validation metric {self.scheduler_metric!r} was not recorded")
         return validation[metric_name]
+
+    def _hook_context(self, *, phase: str, epoch: int | None = None, result: EpochResult | None = None) -> HookContext:
+        """Build the immutable hook context for the current training state."""
+        return HookContext(
+            model=self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            epoch=epoch,
+            global_step=self.global_step,
+            result=result,
+            phase=phase,  # type: ignore[arg-type]
+        )
 
     def _progress_description(self, phase: str) -> str:
         """Build a human-readable phase label without changing training semantics."""
