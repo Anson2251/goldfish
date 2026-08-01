@@ -21,13 +21,14 @@ Asynchronous capture, background workers, dashboards, activation-graph tracing, 
 ## 1. Goals
 
 1. Provide a **generic training hook lifecycle** independent of model family and task.
-2. Make probes **pluggable by registry name** and configurable from a run configuration.
+2. Make probes **pluggable by registry name**, declared by the model configuration and configurable from a run configuration.
 3. Keep probes **read-only**: they must not mutate model, optimizer, scheduler, gradients, or training data, and must restore any transient state they change (for example `model.training` mode).
 4. Persist probe outputs as **append-only, structured, auditable records** separate from training metrics.
 5. Observe **parameters and activations**: parameter-state probes capture learned matrices and derived quantities; activation probes capture statistics of intermediate tensors on a fixed reference input set.
 6. Select observed modules by **named pattern**, so shared mixers, per-layer mixers, dense communication blocks, and latent communication blocks are all observable without model-specific branches.
 7. Record initial, periodic, and final state so the complete trajectory can be reconstructed, with schedules that can **sample the early phase densely**.
-8. Preserve current training behavior when observability is not configured.
+8. **Bind probe declarations to the model profile**: each model profile declares which probes apply to it and how they are configured, so a run never needs to restate per-family probe selections and cannot silently mismatch them.
+9. Preserve current training behavior when observability is not configured.
 
 ---
 
@@ -52,6 +53,7 @@ The public hook, probe, and record schemas must allow an asynchronous implementa
 |---|---|
 | **Hook** | Object subscribed to trainer lifecycle events. A hook may emit artifacts, checkpoints, metrics, or invoke one or more probes. |
 | **Probe** | Read-only plugin that extracts a JSON-serializable observation from a `HookContext`. |
+| **Probe declaration** | The probe selections and options bound to a model profile (§6.0). |
 | **Probe tier** | Parameter-state (no data) or activation (data-dependent) probe family. |
 | **Named pattern** | Glob-like module-path pattern such as `latent_communications.*` used to select observed modules. |
 | **Probe point** | A concrete resolved module path matched by a named pattern. |
@@ -87,7 +89,7 @@ Component responsibilities:
 |---|---|---|
 | `Trainer` | Emits lifecycle events and provides current training state. | Know probe names, JSON schemas, or run paths. |
 | Hook dispatcher | Calls registered hooks in deterministic order. | Perform model-specific analysis. |
-| Probe hook | Applies schedules, supplies the reference batch set, invokes probes. | Know experiment-specific model architecture. |
+| Probe hook | Resolves probe declarations from the model profile, applies run overrides, supplies the reference batch set, invokes probes. | Know experiment-specific model architecture. |
 | Probe | Reads module state and returns observations. | Write files, mutate state, or depend on `train.py`. |
 | Reference provider | Builds the fixed reference batch set from a configured split. | Shuffle, mutate loaders, or use training data. |
 | Recorder | Appends valid records to an artifact journal. | Inspect model internals. |
@@ -147,6 +149,56 @@ Rules:
 ---
 
 ## 6. Probe framework
+
+### 6.0 Probe declaration and resolution
+
+**Probe declarations live in the model profile**, next to the `model` block. A profile declares which probes apply to that model family and how they are configured; a run only enables observability, configures the reference data source, and optionally overrides declarations:
+
+```yaml
+# model-profiles/forecast/multihead-lstm-small-latent-communication.yaml
+schema_version: 1
+model:
+  family: forecast
+  name: multihead-lstm-latent-communication
+  parameters:
+    hidden_dim: 32
+    num_layers: 2
+    dropout: 0.0
+    num_heads: 4
+    communication_dim: 8
+    communication_gate_initial_logit: -5.0
+observability:
+  probes:
+    - name: communication-state
+      include: ["latent_communications.*"]
+      every_n_epochs: 1
+      include_grad_norms: true
+      head_dim: 8
+    - name: activation-stats
+      points:
+        - {path: "latent_communications.*", quantity: "message-magnitude"}
+      every_n_epochs: 1
+```
+
+```yaml
+# run config
+observability:
+  enabled: true
+  reference: {split: val, batches: 8, selection: first}
+  probes:  # optional: replace the profile declaration with the same name
+    - name: activation-stats
+      epochs: [1, 2, 3, 5, 10, 25, 50, 100, 250, 500, 750, 1000]
+```
+
+Resolution rules:
+
+- The **profile declaration** is the default: each declared probe is validated against the probe registry and its options are checked with the same schema as run-level configuration.
+- The run-level `observability` block may set `enabled` (default `false`), `reference` (only meaningful when enabled and an activation probe is active), and `probes`.
+- A run-level `probes` entry must name a probe declared by the profile; it **replaces that declaration entirely** (options and schedule). Run-level entries that name an undeclared probe fail before training starts, as do run-level `probes` when the profile declares none.
+- `enabled: false` (or absent) with `reference` or `probes` present fails before training starts, to surface configuration mistakes instead of silently ignoring them.
+- The training entry point constructs the probe hook from the resolved declarations and the run-level reference block.
+
+Rationale: probe selections are a property of the model architecture (which modules exist and which quantities are meaningful), while the reference data source and schedule preferences are properties of the run. Binding declarations to the profile removes the per-family configuration blocks a user would otherwise have to copy by hand, and makes a declaration that does not match the model fail loudly at `fit_start` via `require_match`.
 
 ### 6.1 Probe protocol
 
@@ -239,17 +291,15 @@ The explicit-list form exists because the questions of interest concentrate in e
 
 ### 6.5 Reference forward
 
-Activation probes require a deterministic input set. The reference configuration is **run-level**, declared next to `probes` so that every activation probe in a run evaluates the same input set:
+Activation probes require a deterministic input set. The reference configuration is **run-level** (probe declarations live in the model profile, §6.0), so that every activation probe in a run evaluates the same input set:
 
 ```yaml
 observability:
+  enabled: true
   reference:
     split: val
     batches: 8
     selection: first
-  probes:
-    - name: activation-stats
-      # ...
 ```
 
 | Option | Default | Meaning |
@@ -288,7 +338,7 @@ Semantics (documented, not a bug):
 
 ### 7.1 `mixer-state` (parameter tier)
 
-Observes `DoublyStochasticMixer` and `UnconstrainedMixer` modules. Required for the shared-vs-distinct mixer trajectory questions (`exp73`/`exp79`/`exp80`/`exp81`/`exp84`/`exp77`).
+Observes `DoublyStochasticMixer` and `UnconstrainedMixer` modules. Required for the shared-vs-distinct mixer trajectory questions (`exp73`/`exp79`/`exp80`/`exp81`/`exp84`/`exp77`). The block below is what a mixer-family model profile declares under its `observability.probes` (§6.0):
 
 ```yaml
 - name: mixer-state
@@ -429,46 +479,107 @@ Field reference, for routing `α` (receiver-by-source, self masked), gates `g`, 
 
 ### 7.3 `activation-stats` (activation tier)
 
-Observes intermediate-tensor statistics on the reference forward. This tier answers the questions parameter snapshots cannot: the actual injected message magnitude for `HeadLatentCommunication` and the actual mixing displacement for mixers.
+Observes intermediate-tensor statistics on the reference forward. This tier answers the questions parameter snapshots cannot: the actual injected message magnitude for `HeadLatentCommunication`, the actual mixing displacement for mixers, and per-layer tensor trajectories (for example the norm of every LSTM layer's output) for diagnosing representation drift.
 
 ```yaml
 - name: activation-stats
   points:
+    - path: "head_layers.*.1"
+      tensors:
+        - name: "output"
+          stats: ["norm", "mean_abs", "std", "p95"]
+        - name: "hidden"
+          stats: ["norm"]
     - path: "latent_communications.*"
       quantity: "message-magnitude"
-    - path: "fusion"
-      quantity: "io-stats"
   every_n_epochs: 1
   require_match: true
 ```
 
-`points` are selected per model family: a run configures only the points whose modules exist in that run's model (see §11 Phase 5 for per-family blocks). With the default `require_match: true`, a point whose pattern matches nothing fails at `fit_start`, so a single config must not mix points for mutually exclusive model families.
+`points` are declared by the model profile (§6.0), so they always match the modules of that model family. With the default `require_match: true`, a point whose pattern matches nothing still fails at `fit_start`, which catches profiles that drift out of sync with their model.
 
 | Option | Default | Meaning |
 |---|---:|---|
-| `points` | required | List of probe points; each entry has `path` (named pattern) and `quantity`. |
+| `points` | required | List of probe points; each entry has `path` (named pattern) plus **either** `quantity` or `tensors`. |
 | `require_match` | `true` | Fail at `fit_start` if any point pattern matches nothing. |
 | `every_n_epochs` / `epochs` / `include_initial` / `include_final` | as §6.4 | Schedule. |
 
 The reference configuration is **not** part of the probe block; it is the run-level `observability.reference` block (§6.5).
 
+#### Declarative tensor points
+
+A point with `tensors` records statistics of named tensors of each matched module:
+
+```yaml
+- path: "head_layers.*.0"
+  tensors:
+    - name: "output"
+      stats: ["norm", "mean_abs", "std", "p95", "max"]
+      reduce: "overall"
+    - name: "input"
+      stats: ["norm"]
+```
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `name` | required | Tensor to observe, resolved per the rules below. |
+| `stats` | required | Non-empty list of statistics from the reference below. |
+| `reduce` | `"overall"` | `"overall"` aggregates over batch, time, and head dimensions; `"per_head"` preserves the head dimension (requires a 4-D tensor `[B, T, N, D]`). |
+
+Tensor name resolution:
+
+| `name` | Source |
+|---|---|
+| `input` | The module's forward input (first tensor when the module receives multiple inputs). |
+| `output` | The module's forward output; when the module returns a tuple (the `nn.LSTM` contract `(output, (h, c))`), the first tensor element. |
+| `hidden` / `cell` | Only for modules returning the LSTM contract: the `h` / `c` components. `h` and `c` have shape `[num_layers, B, D]`; for single-layer modules this is `[1, B, D]`. |
+| any other name | A named tensor from the module's `diagnostics()` method; requires the module to implement `diagnostics()` and return that name. |
+
+Statistics (all computed per element over the tensor's last dimension first, then reduced):
+
+| Stat | Definition per element |
+|---|---|
+| `norm` | `||x||_2` |
+| `mean_abs` | `mean(|x|)` |
+| `std` | standard deviation over the element's feature dimension |
+| `max` | `max(|x|)` |
+| `p95` | 95th percentile of `|x|` |
+
+For a 3-D tensor `[B, T, H]` (for example an LSTM output), elements are the `(b, t)` slices and `overall` reduces to one scalar per stat. For a 4-D tensor `[B, T, N, D]`, elements are the `(b, t, n)` slices: `overall` reduces over all of them, `per_head` reduces over `(b, t)` and emits one value per head. A `per_head` reduce on a tensor without an explicit head dimension fails at the first sampled epoch (§9).
+
+#### Composite quantities
+
+A point with `quantity` computes a semantically named composite from the module's `diagnostics()` tensors. The composite quantities are implemented on top of the same per-element statistics and reductions as declarative points, so the two forms compose in one configuration.
+
 Execution protocol for one sampled epoch:
 
 1. The probe hook ensures `model.eval()` under `torch.no_grad()`, and restores the previous `training` mode afterwards.
 2. For each probe point, the probe registers a forward hook on every matched module; the hook captures the module's input tensors.
-3. Each reference batch is moved to the model device and the model is invoked **exactly once per batch**. Inside the forward pass, each hook synchronously computes the point's statistics under `no_grad`: for `diagnostics`-based quantities it calls `module.diagnostics(captured_inputs)` and reduces the returned tensors; for `io-stats` and `dense-displacement` it reduces the captured input and output directly.
+3. Each reference batch is moved to the model device and the model is invoked **exactly once per batch**. Inside the forward pass, each hook synchronously computes the point's statistics under `no_grad`: declarative tensor points reduce the captured input/output (or `hidden`/`cell`) tensors directly; `diagnostics`-based names and composite quantities call `module.diagnostics(captured_inputs)` and reduce the returned tensors.
 4. Statistics are aggregated over batches and over the batch/time dimensions; raw tensors are never persisted.
 
-The forward hook is the **sole input-capture mechanism**: `diagnostics()` never replaces the hook, it is called from it. Because `diagnostics()` recomputes the module's forward path, modules with diagnostics quantities are executed twice per reference forward — once by the model, once inside the hook — both under `no_grad()`. For the current models this doubles a negligible fraction of the work.
+The forward hook is the **sole input-capture mechanism**: `diagnostics()` never replaces the hook, it is called from it. Because `diagnostics()` recomputes the module's forward path, modules with diagnostics-based names or quantities are executed twice per reference forward — once by the model, once inside the hook — both under `no_grad()`. For the current models this doubles a negligible fraction of the work.
 
-Quantity reference:
+Composite quantity reference:
 
 | Quantity | Required module API | Per-module payload |
 |---|---|---|
 | `message-magnitude` | `HeadLatentCommunication.diagnostics(states)` | `injection_ratio` per receiver: mean over `(B, T)` of `||g_i ⊙ decoded_i||_2 / ||states_i||_2`; `decoded_ratio` per receiver: mean of `||decoded_i||_2 / ||states_i||_2`; `gated_message_norm` overall mean of `||g ⊙ decoded||_2`. |
 | `mixing-displacement` | `DoublyStochasticMixer`/`UnconstrainedMixer` `diagnostics(channels)` | `displacement_ratio` overall mean of `||output - input||_2 / ||input||_2`; `displacement_ratio_per_head`; `input_norm` overall mean of `||input||_2`. |
 | `dense-displacement` | none (forward hook on `nn.Linear` communication blocks) | `displacement_ratio` overall mean of `||W x + b - x||_2 / ||x||_2`; `output_norm`; `input_norm`. Identity initialization makes the baseline ≈ `0`. |
-| `io-stats` | none (forward hook on module input/output) | `input_norm` / `output_norm` overall mean of `L2` norms; `input_mean_abs` / `output_mean_abs`. |
+| `io-stats` | none (forward hook on module input/output) | `input_norm` / `output_norm` overall mean of `L2` norms; `input_mean_abs` / `output_mean_abs`. Equivalent to a declarative point with `name: input` and `name: output`, `stats: ["norm", "mean_abs"]`. |
+
+Example payload for a declarative tensor point on the second LSTM layer of every head:
+
+```json
+{
+  "module": "head_layers.0.1",
+  "tensors": {
+    "output": {"norm": 1.74, "mean_abs": 0.21, "std": 0.26, "p95": 0.58},
+    "hidden": {"norm": 0.95}
+  }
+}
+```
 
 Example payload for `message-magnitude` on a 4-head latent block:
 
@@ -500,7 +611,7 @@ Example payload for `mixing-displacement` on the shared 4-head mixer:
 
 Aggregation rules:
 
-- All ratios are computed per `(batch, time)` element first, then reduced with **mean** over the reduced dimensions; `_mean`-suffixed fields additionally aggregate over receivers.
+- All statistics and ratios are computed per element (per `(batch, time)` slice, or per `(batch, time, head)` slice for 4-D tensors) first, then reduced with **mean** over the remaining dimensions; `_mean`-suffixed fields additionally aggregate over receivers.
 - A zero denominator (a fully zero head state) yields `null` for that element before reduction; if every element is `null`, the field is `null`.
 - `include_initial: true` records activation statistics on the freshly initialized model; this is the baseline every later epoch is compared against. On a resumed run, the `fit_start` record reflects the restored state instead (see §8.4).
 
@@ -543,6 +654,7 @@ runs/expNN/
       "name": "communication-state",
       "schedule": {"every_n_epochs": 1, "include_initial": true, "include_final": true},
       "options": {"include_grad_norms": true, "require_match": true, "head_dim": 8},
+      "source": "profile",
       "patterns": ["latent_communications.*"],
       "matched_modules": ["latent_communications.0"]
     },
@@ -550,6 +662,7 @@ runs/expNN/
       "name": "activation-stats",
       "schedule": {"every_n_epochs": 1, "include_initial": true, "include_final": true},
       "options": {"require_match": true},
+      "source": "run_override",
       "points": [
         {"pattern": "latent_communications.*", "quantity": "message-magnitude", "matched_modules": ["latent_communications.0"]},
         {"pattern": "fusion", "quantity": "io-stats", "matched_modules": ["fusion"]}
@@ -565,7 +678,8 @@ Rules:
 - The manifest describes the requested **and resolved** configuration: `matched_modules` and `reference.split_fingerprint` are written at `fit_start` once discovery and reference capture succeed.
 - `split_fingerprint` is read from the run's dataset lock for the referenced split.
 - `first_batch_shapes` records the tensor shape of the **first captured reference batch** per probe-point module (a single batch, whose leading dimension is the loader's batch size; `2048` matches the current experiments' batch size), so analysis can verify input size assumptions.
-- For `activation-stats`, the manifest records resolved **points** (`pattern` → `quantity` → concrete `matched_modules`), not a flat pattern list, because each point's quantity is part of the configuration.
+- For `activation-stats`, the manifest records resolved **points** (`pattern` → `quantity` or `tensors` → concrete `matched_modules`), not a flat pattern list, because each point's statistic configuration is part of the configuration.
+- Each probe entry records `source`: `"profile"` when it came from the model profile declaration unchanged, or `"run_override"` when the run replaced it. This makes probe provenance auditable in the record.
 
 ### 8.3 JSONL record envelope
 
@@ -613,12 +727,17 @@ Configured probe failures are significant because missing probe data can invalid
 |---|---|
 | Invalid probe configuration | Fail before training starts. |
 | Unknown probe name | Fail before training starts. |
+| Run-level `probes` entry not declared by the model profile | Fail before training starts. |
+| Run-level `probes` given but the profile declares none | Fail before training starts. |
+| `enabled: false` with `reference` or `probes` present | Fail before training starts. |
 | Pattern matches no module and `require_match: true` | Fail at `fit_start`. |
 | Pattern matches a module of unsupported type | Fail at `fit_start` with module path and expected types. |
 | `epochs` list not strictly increasing, or both `every_n_epochs` and `epochs` given | Fail before training starts. |
 | Activation probes configured without an injected reference provider | Fail before training starts. |
 | Reference split unavailable or yields fewer than `batches` batches | Fail at `fit_start`. |
 | `diagnostics()` returns an unknown tensor name for the requested quantity | Fail at `fit_start` with probe and quantity context. |
+| `tensors.name` is not `input`/`output`/`hidden`/`cell` and the module lacks `diagnostics()` or does not return that name | Fail at the first sampled epoch with module path and tensor name. |
+| `per_head` reduce on a tensor without an explicit head dimension (not `[B, T, N, D]`) | Fail at the first sampled epoch with module path and tensor name. |
 | Probe returns non-JSON data | Fail immediately with probe and field context. |
 | Non-finite statistic (zero denominator everywhere) | Record `null`, never fail. |
 | Recorder write failure | Fail training; run is marked failed by normal run lifecycle. |
@@ -631,6 +750,9 @@ A non-fatal `failure_policy: warn` may be added later, but should not be part of
 ## 10. Proposed module layout
 
 ```text
+goldfish/config/observability.py   # Probe/Reference/Schedule dataclasses and resolve_observability_config (profile + run overrides)
+goldfish/models/…/profile parsing  # load_model_profile additionally parses the optional observability block
+
 goldfish/observability/
 ├── __init__.py
 ├── events.py        # HookContext, ProbePhase, TrainingHook, EpochResult imports
@@ -668,10 +790,11 @@ goldfish/observability/
 ### Phase 2: framework
 
 1. Add the probe registry, schedule parsing, and named-pattern discovery.
-2. Add the reference batch provider (`selection: first`) and the provider-factory injection point in the training entry point (a run with activation probes but no injected provider fails before training starts).
-3. Add the JSONL recorder and manifest writer.
-4. Parse and validate `observability.reference` and `observability.probes` in resolved training config.
-5. Construct `ProbeHook` from the configured plugins.
+2. Add `resolve_observability_config` in `goldfish/config/observability.py`: validates the profile `observability` block, applies run-level overrides (`enabled`, `reference`, `probes`), and rejects undeclared or conflicting entries.
+3. Extend `load_model_profile` to parse the optional profile-level `observability` block.
+4. Add the reference batch provider (`selection: first`) and the provider-factory injection point in the training entry point (a run with activation probes but no injected provider fails before training starts).
+5. Add the JSONL recorder and manifest writer.
+6. Construct `ProbeHook` from the resolved declarations and run-level reference block.
 
 ### Phase 3: parameter-tier probes
 
@@ -682,18 +805,17 @@ goldfish/observability/
 
 ### Phase 4: activation-tier probe
 
-1. Implement `ActivationStatsProbe` with `message-magnitude`, `mixing-displacement`, `dense-displacement`, and `io-stats`.
-2. Add unit tests for statistics, `null` handling, and training-mode restoration.
-3. Add a small numeric integration test asserting initial, periodic, and final records for a `LatentCommunicationMultiHeadLSTMForecastModel`.
+1. Implement `ActivationStatsProbe` with the declarative tensor-point primitives (per-element stats, `overall`/`per_head` reductions, LSTM `output`/`hidden`/`cell` resolution) and the composite quantities `message-magnitude`, `mixing-displacement`, `dense-displacement`, and `io-stats`.
+2. Add unit tests for statistics, `null` handling, `per_head` errors, and training-mode restoration.
+3. Add a small numeric integration test asserting initial, periodic, and final records for a `LatentCommunicationMultiHeadLSTMForecastModel` and for a declarative per-layer norm point on a multi-head model.
 
 ### Phase 5: enablement
 
-Enable observability for the next seed-sweep experiments. Because the model families are mutually exclusive, the configuration is per family; a run applies the block matching its model:
+Declare probes in the model profiles used by the seed-sweep experiments. Each family declares only its own probes, so run configurations reduce to `enabled` plus `reference`:
 
 ```yaml
-# Mixer family (exp73, exp77, exp79, exp80, exp81, exp84)
+# model-profiles/forecast/multihead-lstm-small.yaml (mixer family: exp73, exp77, exp79, exp80, exp81, exp84)
 observability:
-  reference: {split: val, batches: 8, selection: first}
   probes:
     - name: mixer-state
       every_n_epochs: 1
@@ -705,9 +827,8 @@ observability:
 ```
 
 ```yaml
-# Dense communication family (exp86)
+# model-profiles/forecast/multihead-lstm-small-communication.yaml (dense family: exp86)
 observability:
-  reference: {split: val, batches: 8, selection: first}
   probes:
     - name: communication-state
       include: ["communications.*"]
@@ -721,9 +842,8 @@ observability:
 ```
 
 ```yaml
-# Latent communication family (exp87)
+# model-profiles/forecast/multihead-lstm-small-latent-communication.yaml (latent family: exp87)
 observability:
-  reference: {split: val, batches: 8, selection: first}
   probes:
     - name: communication-state
       include: ["latent_communications.*"]
@@ -737,10 +857,23 @@ observability:
       every_n_epochs: 1
 ```
 
-For dense and latent communication runs, prefer the early-dense schedule on the communication probes:
+A run using one of these profiles then only needs:
 
 ```yaml
-epochs: [1, 2, 3, 5, 10, 25, 50, 100, 250, 500, 750, 1000]
+observability:
+  enabled: true
+  reference: {split: val, batches: 8, selection: first}
+```
+
+For dense and latent communication runs, prefer the early-dense schedule by overriding the communication probes at run level:
+
+```yaml
+observability:
+  enabled: true
+  reference: {split: val, batches: 8, selection: first}
+  probes:
+    - name: communication-state
+      epochs: [1, 2, 3, 5, 10, 25, 50, 100, 250, 500, 750, 1000]
 ```
 
 ---
@@ -748,20 +881,23 @@ epochs: [1, 2, 3, 5, 10, 25, 50, 100, 250, 500, 750, 1000]
 ## 12. Acceptance criteria for the MVP
 
 1. A run with no `observability` configuration produces exactly the current run layout and training behavior.
-2. A run with `mixer-state` enabled creates `artifacts/probes/manifest.json` and `mixer-state.jsonl`.
+2. A run with `observability.enabled: true` and a profile declaring `mixer-state` creates `artifacts/probes/manifest.json` and `mixer-state.jsonl`.
 3. The journal contains a `fit_start` record at epoch `0`, periodic `epoch_end` records, and a `fit_end` record.
 4. A shared-mixer model produces one mixer entry named `mixer`; a distinct-mixer model with `num_layers=2` produces `mixers.0` and `mixers.1`, with no duplicate alias entry.
 5. `mixer-state` records both `logits` and projected `matrix`, and with `include_grad_norms: true` records `grad_norms.logits`.
 6. `communication-state` on a dense model reproduces the exp86 block norms (`block_diagonal_deviation_norm`, `block_cross_norm_mean/max`); on a latent model it records routing, entropy, and gate statistics.
 7. `activation-stats` with `message-magnitude` records `injection_ratio` and `decoded_ratio` per receiver on the reference set, and the values differ meaningfully between `fit_start` and late epochs for a latent-communication model.
-8. `activation-stats` restores the model's `training` mode and leaves gradients and RNG state untouched.
-9. An `epochs` list schedule samples exactly the listed epochs plus `fit_start`/`fit_end` per `include_*`.
-10. The manifest contains resolved `matched_modules` (points with quantities for `activation-stats`), the run-level `reference` block, and `reference.split_fingerprint`.
-11. All activation probes in one run share the single run-level reference batch set recorded in the manifest.
-12. A run with activation probes but no injected reference provider fails before training starts.
-13. All persisted values are valid JSON and finite or `null` where numeric.
-14. Existing training, checkpoint, and metrics tests continue to pass.
-15. From probe records alone, an analyst can answer: (a) whether each mixer stayed near identity or diverged, including a logits-vs-projected distinction; (b) the actual injected message magnitude trajectory for latent communication; (c) the actual mixing displacement trajectory; (d) whether communication parameters receive gradient flow at each sampled epoch.
+8. A declarative `activation-stats` point with `tensors: [{name: "output", stats: ["norm"]}]` on `head_layers.*.1` records one `norm` per matched module (every head's second LSTM layer), and a `reduce: "per_head"` point on a `[B, T, N, D]` tensor emits one value per head.
+9. `activation-stats` restores the model's `training` mode and leaves gradients and RNG state untouched.
+10. An `epochs` list schedule samples exactly the listed epochs plus `fit_start`/`fit_end` per `include_*`.
+11. The manifest contains resolved `matched_modules` (points with quantities or tensor configs for `activation-stats`), the run-level `reference` block, `reference.split_fingerprint`, and per-probe `source` (`"profile"` or `"run_override"`).
+12. All activation probes in one run share the single run-level reference batch set recorded in the manifest.
+13. A run with activation probes but no injected reference provider fails before training starts.
+14. A run whose `observability.probes` names a probe the model profile does not declare fails before training starts; a run-level probe entry replaces the profile declaration of the same name entirely.
+15. A profile declaring a probe whose pattern matches nothing in its model fails at `fit_start` (via `require_match`).
+16. All persisted values are valid JSON and finite or `null` where numeric.
+17. Existing training, checkpoint, and metrics tests continue to pass.
+18. From probe records alone, an analyst can answer: (a) whether each mixer stayed near identity or diverged, including a logits-vs-projected distinction; (b) the actual injected message magnitude trajectory for latent communication; (c) the actual mixing displacement trajectory; (d) whether communication parameters receive gradient flow at each sampled epoch; (e) the norm trajectory of any configured module/layer (for example each LSTM layer's output).
 
 ---
 
@@ -785,5 +921,5 @@ The hypotheses in `docs/multihead-lstm/HYPOTHESES.md` include interventions (fre
 
 - `docs/multihead-lstm/HYPOTHESES.md` priority item 1 ("record `||gate ⊙ D(m)|| / ||h||`, routing, and gates through training") maps to `communication-state` (routing, gates) plus `activation-stats`/`message-magnitude` (`injection_ratio`).
 - Priority item 5 (intermediate `exp79` mixer trajectory) maps to `mixer-state` with the early-dense `epochs` schedule.
-- Priority item 3 (uniform-ratio sweep) and item 2 (seed sweep) only require observability enabled per run: the per-family configuration from §11 Phase 5 applies unchanged across seeds of the same model family.
+- Priority item 3 (uniform-ratio sweep) and item 2 (seed sweep) only require `observability.enabled: true` plus `reference` per run: the probe declarations live in each model profile (§11 Phase 5) and apply unchanged across seeds of the same model family.
 - The exp86 block-norm analysis in `LAYERWISE_MIXING_EXPERIMENTS.md` is reproduced automatically by `communication-state` at every sampled epoch.
