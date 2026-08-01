@@ -53,9 +53,10 @@ class ProbeHook(TrainingHook):
             self._reference_batches = tuple(self.reference_factory())
         if self.manifest is not None:
             self.recorder.write_manifest(self.manifest)
+        enriched = self._with_reference_batches(context)
         for probe, schedule in self.probes:
             if schedule.include_initial:
-                payload = probe.collect(context)
+                payload = probe.collect(enriched)
                 if payload is not None:
                     self.recorder.write_record(probe.name, "fit_start", 0, context.global_step, payload)
 
@@ -145,7 +146,15 @@ def _options_mapping(probe: ProbeConfig) -> dict[str, Any]:
         for key, value in asdict(probe).items()
         if key not in {"name", "schedule", "points"}
     }
+    if probe.points:
+        options["points"] = [_point_mapping(point) for point in probe.points]
     return options
+
+
+def _point_mapping(point) -> dict[str, Any]:
+    if point.quantity is not None:
+        return {"path": point.path, "quantity": point.quantity}
+    return {"path": point.path, "tensors": [asdict(spec) for spec in point.tensors]}
 
 
 def _jsonable(value: Any) -> Any:

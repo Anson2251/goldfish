@@ -147,7 +147,7 @@ def test_reference_factory_runs_once_at_fit_start_and_populates_contexts(tmp_pat
     hook.on_epoch_end(_context(phase="epoch_end", epoch=0))
 
     assert calls == [1]
-    assert probe.contexts[0].reference_batches is None  # fit_start context is not enriched
+    assert probe.contexts[0].reference_batches == ("batch-a", "batch-b")  # fit_start is enriched too
     assert probe.contexts[1].reference_batches == ("batch-a", "batch-b")
 
 
