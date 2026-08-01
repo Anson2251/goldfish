@@ -21,3 +21,5 @@ wheels/
 !/data/fourier-lb256/**
 /artifacts
 /runs
+
+.DS_Store
