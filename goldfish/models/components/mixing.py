@@ -57,6 +57,10 @@ class UnconstrainedMixer(nn.Module):
             raise ValueError("channels must have a non-empty feature dimension")
         return torch.matmul(self.mixing.weight.to(dtype=channels.dtype), channels)
 
+    def diagnostics(self, channels: Tensor) -> dict[str, Tensor]:
+        """Return the input, output, and mixing matrix for observability."""
+        return {"input": channels, "output": self.forward(channels), "mixing_matrix": self.mixing.weight}
+
 
 class DoublyStochasticMixer(nn.Module):
     """Mix channels with a learnable doubly stochastic matrix.
@@ -130,3 +134,7 @@ class DoublyStochasticMixer(nn.Module):
 
         mixing = self.mixing_matrix().to(dtype=channels.dtype)
         return torch.matmul(mixing, channels)
+
+    def diagnostics(self, channels: Tensor) -> dict[str, Tensor]:
+        """Return the input, output, and projected mixing matrix for observability."""
+        return {"input": channels, "output": self.forward(channels), "mixing_matrix": self.mixing_matrix()}

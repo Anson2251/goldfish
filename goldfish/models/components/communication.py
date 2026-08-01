@@ -77,14 +77,41 @@ class HeadLatentCommunication(nn.Module):
             raise ValueError(
                 f"states must have trailing shape ({self.num_heads}, {self.head_dim}), got {tuple(states.shape[-2:])}"
             )
+        return states + self.gates().to(dtype=states.dtype) * self._decode(self._encode(states))[1]
 
-        latents = torch.stack(
+    def diagnostics(self, states: Tensor) -> dict[str, Tensor]:
+        """Return named intermediate tensors for observability.
+
+        ``gated_messages`` equals ``gates * decoded``, the actual residual
+        injected by :meth:`forward`.
+        """
+        if states.ndim != 4:
+            raise ValueError("states must have shape [batch, time, heads, features]")
+        if states.shape[-2:] != (self.num_heads, self.head_dim):
+            raise ValueError(
+                f"states must have trailing shape ({self.num_heads}, {self.head_dim}), got {tuple(states.shape[-2:])}"
+            )
+        latents = self._encode(states)
+        messages, decoded = self._decode(latents)
+        gated = self.gates().to(dtype=states.dtype) * decoded
+        return {
+            "states": states,
+            "latents": latents,
+            "messages": messages,
+            "decoded": decoded,
+            "gated_messages": gated,
+        }
+
+    def _encode(self, states: Tensor) -> Tensor:
+        return torch.stack(
             [encoder(states[..., index, :]) for index, encoder in enumerate(self.source_encoders)],
             dim=-2,
         )
+
+    def _decode(self, latents: Tensor) -> tuple[Tensor, Tensor]:
         messages = torch.einsum("ij,...jd->...id", self.routing_weights().to(dtype=latents.dtype), latents)
         decoded = torch.stack(
             [decoder(messages[..., index, :]) for index, decoder in enumerate(self.destination_decoders)],
             dim=-2,
         )
-        return states + self.gates().to(dtype=states.dtype) * decoded
+        return messages, decoded
