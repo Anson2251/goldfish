@@ -6,23 +6,28 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, is_dataclass, replace
 from typing import Any
 
+from torch import nn
+
 from goldfish.config.observability import (
     ProbeConfig,
     ResolvedObservabilityConfig,
     ScheduleConfig,
 )
+from goldfish.observability.discovery import discover_modules
 from goldfish.observability.events import HookContext, TrainingHook
 from goldfish.observability.probes import ProbeRegistry, probe_registry
 from goldfish.observability.recorder import JsonlRecorder, SCHEMA_VERSION
 
 ReferenceFactory = Callable[[], Sequence[Any]]
+ManifestFactory = Callable[[nn.Module, Sequence[Any] | None], Mapping[str, Any]]
 
 
 def should_sample(schedule: ScheduleConfig, epoch_one_based: int) -> bool:
     """Decide whether an epoch_end observation should be taken."""
     if schedule.epochs is not None:
         return epoch_one_based in schedule.epochs
-    assert schedule.every_n_epochs is not None
+    if schedule.every_n_epochs is None:
+        raise ValueError("schedule must declare either every_n_epochs or epochs")
     return epoch_one_based % schedule.every_n_epochs == 0
 
 
@@ -40,28 +45,31 @@ class ProbeHook(TrainingHook):
         probes: Sequence[tuple[Any, ScheduleConfig]],
         *,
         reference_factory: ReferenceFactory | None = None,
-        manifest: Mapping[str, Any] | None = None,
+        manifest_factory: ManifestFactory | None = None,
     ) -> None:
         self.recorder = recorder
         self.probes = tuple(probes)
         self.reference_factory = reference_factory
-        self.manifest = dict(manifest) if manifest is not None else None
+        self.manifest_factory = manifest_factory
         self._reference_batches: Sequence[Any] | None = None
 
     def on_fit_start(self, context: HookContext) -> None:
         if self.reference_factory is not None:
             self._reference_batches = tuple(self.reference_factory())
-        if self.manifest is not None:
-            self.recorder.write_manifest(self.manifest)
         enriched = self._with_reference_batches(context)
         for probe, schedule in self.probes:
             if schedule.include_initial:
                 payload = probe.collect(enriched)
                 if payload is not None:
                     self.recorder.write_record(probe.name, "fit_start", 0, context.global_step, payload)
+        if self.manifest_factory is not None:
+            # Written after the collect pass so discovery and reference capture
+            # have run; the manifest carries the resolved matched modules.
+            self.recorder.write_manifest(self.manifest_factory(context.model, self._reference_batches))
 
     def on_epoch_end(self, context: HookContext) -> None:
-        assert context.epoch is not None
+        if context.epoch is None:
+            raise ValueError("epoch_end events require an epoch")
         enriched = self._with_reference_batches(context)
         for probe, schedule in self.probes:
             if not should_sample(schedule, context.epoch + 1):
@@ -71,7 +79,8 @@ class ProbeHook(TrainingHook):
                 self.recorder.write_record(probe.name, "epoch_end", context.epoch + 1, context.global_step, payload)
 
     def on_fit_end(self, context: HookContext) -> None:
-        assert context.epoch is not None
+        if context.epoch is None:
+            raise ValueError("fit_end events require an epoch")
         enriched = self._with_reference_batches(context)
         for probe, schedule in self.probes:
             if not schedule.include_final:
@@ -92,49 +101,89 @@ def build_probe_hook(
     *,
     registry: ProbeRegistry = probe_registry,
     reference_factory: ReferenceFactory | None = None,
-    manifest: Mapping[str, Any] | None = None,
+    source_paths: Mapping[str, str] | None = None,
+    split_fingerprint: str | None = None,
 ) -> ProbeHook | None:
     """Assemble a ``ProbeHook`` from a resolved observability configuration.
 
     Returns ``None`` when the configuration declares no probes, preserving the
-    no-observability training path.
+    no-observability training path. Activation probes require an injected
+    reference provider; the failure surfaces here, before training starts.
     """
     if not config.probes:
         return None
+    if any(probe.name == "activation-stats" for probe in config.probes) and reference_factory is None:
+        raise ValueError("activation-stats probes require an injected reference provider")
     probes = [(registry.create(probe.name, _options_mapping(probe)), probe.schedule) for probe in config.probes]
     return ProbeHook(
         recorder,
         probes,
         reference_factory=reference_factory,
-        manifest=manifest,
+        manifest_factory=_make_manifest_factory(
+            config,
+            source_paths or {},
+            split_fingerprint,
+        ),
     )
+
+
+def _make_manifest_factory(
+    config: ResolvedObservabilityConfig,
+    source_paths: Mapping[str, str],
+    split_fingerprint: str | None,
+) -> ManifestFactory:
+    def build(model: nn.Module, reference_batches: Sequence[Any] | None) -> Mapping[str, Any]:
+        return build_manifest(
+            config,
+            model,
+            source_paths=source_paths,
+            split_fingerprint=split_fingerprint,
+        )
+
+    return build
 
 
 def build_manifest(
     config: ResolvedObservabilityConfig,
+    model: nn.Module,
     *,
     source_paths: Mapping[str, str],
+    split_fingerprint: str | None = None,
 ) -> dict[str, Any]:
-    """Build the resolved probe manifest from a configuration.
+    """Build the resolved probe manifest from a configuration and the live model.
 
-    ``source_paths`` maps probe names to ``"profile"`` or ``"run_override"``
-    for provenance; concrete ``matched_modules`` are filled in by discovery at
-    ``fit_start`` in a later phase.
+    ``matched_modules`` are resolved by discovery against the model at
+    ``fit_start``; ``source_paths`` maps probe names to ``"profile"`` or
+    ``"run_override"`` for provenance.
     """
     manifest: dict[str, Any] = {"schema_version": SCHEMA_VERSION}
     if config.reference is not None:
-        manifest["reference"] = _jsonable(asdict(config.reference))
+        reference = _jsonable(asdict(config.reference))
+        if split_fingerprint is not None:
+            reference["split_fingerprint"] = split_fingerprint
+        manifest["reference"] = reference
     probes: list[dict[str, Any]] = []
     for probe in config.probes:
         entry: dict[str, Any] = {
             "name": probe.name,
             "schedule": _jsonable(asdict(probe.schedule)),
-            "options": _jsonable({key: value for key, value in _options_mapping(probe).items() if key != "include"}),
+            "options": _jsonable({key: value for key, value in _options_mapping(probe).items() if key not in {"include", "points"}}),
             "patterns": list(probe.include) if probe.include else [],
             "source": source_paths.get(probe.name, "profile"),
         }
+        patterns = list(probe.include) if probe.include else []
         if probe.points:
-            entry["points"] = [_jsonable(asdict(point)) for point in probe.points]
+            entry["points"] = []
+            for point in probe.points:
+                entry["points"].append(
+                    {
+                        "pattern": point.path,
+                        "quantity": point.quantity,
+                        "matched_modules": [path for path, _ in discover_modules(model, (point.path,))],
+                    }
+                )
+        if patterns:
+            entry["matched_modules"] = [path for path, _ in discover_modules(model, tuple(patterns))]
         probes.append(entry)
     manifest["probes"] = probes
     return manifest

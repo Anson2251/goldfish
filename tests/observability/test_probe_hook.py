@@ -152,12 +152,14 @@ def test_reference_factory_runs_once_at_fit_start_and_populates_contexts(tmp_pat
 
 
 def test_manifest_is_written_at_fit_start(tmp_path: Path) -> None:
+    from torch import nn
+
     probe = StubProbe("mixer-state", {"ok": True})
     manifest = {"schema_version": 2, "probes": [{"name": "mixer-state"}]}
     hook = ProbeHook(
         JsonlRecorder(tmp_path / "artifacts" / "probes"),
         [(probe, ScheduleConfig(every_n_epochs=1))],
-        manifest=manifest,
+        manifest_factory=lambda model, batches: manifest,
     )
 
     hook.on_fit_start(_context(phase="fit_start", epoch=None))

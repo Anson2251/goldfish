@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from torch import nn
 
 from goldfish.models import (
     InterLayerCommunicationMultiHeadLSTMForecastModel,
@@ -274,3 +275,73 @@ def test_without_reference_batches_raises() -> None:
 
     with pytest.raises(RuntimeError, match="reference"):
         probe.collect(_context(_mixer_model(), batches=None))  # type: ignore[arg-type]
+
+
+def test_zero_denominators_record_null_not_nan() -> None:
+    from goldfish.models.components import DoublyStochasticMixer
+
+    class ZeroMixerModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mixer = DoublyStochasticMixer(NUM_HEADS, sinkhorn_iterations=20)
+
+        def forward(self, batch):
+            return self.mixer(torch.zeros(batch.inputs.shape[0], LOOKBACK, NUM_HEADS, HEAD_DIM))
+
+    probe = ActivationStatsProbe(
+        {
+            "points": [
+                {"path": "mixer", "quantity": "mixing-displacement"},
+            ]
+        }
+    )
+
+    entry = probe.collect(_context(ZeroMixerModel(), batches=_batches(1)))["points"][0]
+
+    assert entry["input_norm"] == 0.0  # absolute statistics remain valid
+    assert entry["displacement_ratio"] is None
+    assert entry["displacement_ratio_per_head"] == [None, None, None, None]
+
+
+def test_two_points_on_the_same_module_do_not_collide() -> None:
+    probe = ActivationStatsProbe(
+        {
+            "points": [
+                {"path": "mixer", "quantity": "io-stats"},
+                {"path": "mixer", "quantity": "mixing-displacement"},
+            ]
+        }
+    )
+
+    entries = probe.collect(_context(_mixer_model()))["points"]
+
+    assert [entry["quantity"] for entry in entries] == ["io-stats", "mixing-displacement"]
+    assert "input_norm" in entries[0]
+    assert "displacement_ratio" in entries[1]
+
+
+def test_diagnostics_error_includes_module_path_and_quantity() -> None:
+    from torch import nn
+
+    class PlainModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+        def forward(self, inputs):
+            return inputs
+
+    class Wrapper(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.plain = PlainModule()
+
+        def forward(self, inputs):
+            return self.plain(inputs)
+
+    probe = ActivationStatsProbe(
+        {"points": [{"path": "plain", "quantity": "mixing-displacement"}]}
+    )
+
+    with pytest.raises(ValueError, match="plain.*diagnostics"):
+        probe.collect(_context(Wrapper(), batches=_batches(1)))

@@ -163,8 +163,8 @@ def _probe(values: Any, prefix: str) -> ProbeConfig:
 
     include = values.get("include")
     include_tuple = tuple(include) if include is not None else None
-    if include is not None and not isinstance(include, list):
-        raise ValueError(f"{prefix}.include must be a list of patterns")
+    if include is not None and (not isinstance(include, list) or not include):
+        raise ValueError(f"{prefix}.include must be a non-empty list of patterns")
     if include_tuple is None and name == "mixer-state":
         include_tuple = ("mixer", "mixers.*")
 

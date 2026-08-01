@@ -131,3 +131,42 @@ def test_all_numeric_values_are_json_serializable() -> None:
         for key, value in entry.items():
             if isinstance(value, float):
                 assert math.isfinite(value)
+
+
+def test_fit_start_refreshes_logits_baseline_for_resumed_runs() -> None:
+    model = _model()
+    probe = MixerStateProbe({})
+
+    def context(phase: str) -> HookContext:
+        return HookContext(model=model, optimizer=None, scheduler=None, epoch=None, global_step=2, result=None, phase=phase)  # type: ignore[arg-type]
+
+    probe.collect(context(phase="fit_start"))
+    with torch.no_grad():
+        model.mixer.logits.add_(1.0)
+    # A resumed fit restarts the baseline at fit_start: distance resets to zero.
+    assert probe.collect(context(phase="fit_start"))["mixers"][0]["logits_distance_to_initial"] == 0.0
+    # Subsequent epoch records measure from the new baseline.
+    with torch.no_grad():
+        model.mixer.logits.add_(0.5)
+    assert probe.collect(context(phase="epoch_end"))["mixers"][0]["logits_distance_to_initial"] > 0.0
+
+
+def test_large_mixer_omits_matrix_by_default() -> None:
+    from torch import nn
+
+    from goldfish.models.components import DoublyStochasticMixer
+
+    class Wrapper(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mixer = DoublyStochasticMixer(20, initialization="identity", identity_strength=10.0)
+
+    model = Wrapper()
+    probe = MixerStateProbe({})
+    entry = probe.collect(_context(model))["mixers"][0]
+    assert "matrix" not in entry  # N > 16 defaults to summary-only
+    assert entry["shape"] == [20, 20]
+    assert entry["off_diagonal_mass"] < 0.05  # 19 off-diagonal entries per row of ~4.5e-5
+
+    explicit = MixerStateProbe({"include_matrix": True})
+    assert "matrix" in explicit.collect(_context(model))["mixers"][0]

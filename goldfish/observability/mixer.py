@@ -27,35 +27,45 @@ class MixerStateProbe:
     def __init__(self, options: Mapping[str, Any]) -> None:
         self.include = tuple(options.get("include", ("mixer", "mixers.*")))
         self.include_matrix = bool(options.get("include_matrix", True))
+        self._include_matrix_explicit = "include_matrix" in options
         self.include_logits = bool(options.get("include_logits", True))
         self.include_grad_norms = bool(options.get("include_grad_norms", False))
         self.require_match = bool(options.get("require_match", True))
         self._initial_logits: dict[int, Tensor] = {}
 
     def collect(self, context: HookContext) -> Mapping[str, Any] | None:
-        matches = discover_modules(context.model, self.include)
-        if not matches:
-            if self.require_match:
-                raise ValueError(f"mixer-state found no mixer matching patterns {list(self.include)}")
-            return None
-        return {"mixers": [self._extract(path, module) for path, module in matches]}
+        if context.phase == "fit_start":
+            # The fit-start record is the baseline for logits_distance_to_initial;
+            # a resumed run restarts the baseline from its restored state.
+            self._initial_logits.clear()
+        with torch.no_grad():
+            matches = discover_modules(context.model, self.include)
+            if not matches:
+                if self.require_match:
+                    raise ValueError(f"mixer-state found no mixer matching patterns {list(self.include)}")
+                return None
+            return {"mixers": [self._extract(path, module) for path, module in matches]}
 
     def _extract(self, path: str, module: nn.Module) -> dict[str, Any]:
         if isinstance(module, DoublyStochasticMixer):
             return self._extract_doubly_stochastic(path, module)
         if isinstance(module, UnconstrainedMixer):
             return self._extract_unconstrained(path, module)
-        raise ValueError(f"mixer-state does not support module {path!r} of type {type(module).__name__}")
+        raise ValueError(
+            f"mixer-state does not support module {path!r} of type {type(module).__name__}; "
+            "expected DoublyStochasticMixer or UnconstrainedMixer"
+        )
 
     def _extract_doubly_stochastic(self, path: str, module: DoublyStochasticMixer) -> dict[str, Any]:
         projected = module.mixing_matrix().detach().to(dtype=torch.float64)
+        include_matrix = self.include_matrix if self._include_matrix_explicit else projected.shape[0] <= 16
         entry = {
             "module": path,
             "type": "doubly_stochastic",
             "shape": list(projected.shape),
             **_matrix_statistics(projected),
         }
-        if self.include_matrix:
+        if include_matrix:
             entry["matrix"] = _nested_list(projected)
         if self.include_logits:
             logits = module.logits.detach().to(dtype=torch.float64)
@@ -70,6 +80,7 @@ class MixerStateProbe:
 
     def _extract_unconstrained(self, path: str, module: UnconstrainedMixer) -> dict[str, Any]:
         weight = module.mixing_matrix().detach().to(dtype=torch.float64)
+        include_matrix = self.include_matrix if self._include_matrix_explicit else weight.shape[0] <= 16
         entry = {
             "module": path,
             "type": "unconstrained",
@@ -78,7 +89,7 @@ class MixerStateProbe:
             "row_sum_max_error": None,
             "column_sum_max_error": None,
         }
-        if self.include_matrix:
+        if include_matrix:
             entry["matrix"] = _nested_list(weight)
         entry["logits"] = None
         entry["logits_distance_to_initial"] = None

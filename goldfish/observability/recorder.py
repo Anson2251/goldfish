@@ -41,7 +41,7 @@ class JsonlRecorder:
             "global_step": global_step,
             "payload": dict(payload),
         }
-        line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
         path = self.directory / f"{probe}.jsonl"
         self.directory.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:

@@ -34,22 +34,28 @@ class CommunicationStateProbe:
         self.require_match = bool(options.get("require_match", True))
 
     def collect(self, context: HookContext) -> Mapping[str, Any] | None:
-        matches = discover_modules(context.model, self.include)
-        if not matches:
-            if self.require_match:
-                raise ValueError(f"communication-state found no communication module matching patterns {list(self.include)}")
-            return None
-        return {"communications": [self._extract(path, module, context.model) for path, module in matches]}
+        with torch.no_grad():
+            matches = discover_modules(context.model, self.include)
+            if not matches:
+                if self.require_match:
+                    raise ValueError(f"communication-state found no communication module matching patterns {list(self.include)}")
+                return None
+            return {"communications": [self._extract(path, module, context.model) for path, module in matches]}
 
     def _extract(self, path: str, module: nn.Module, model: nn.Module) -> dict[str, Any]:
         if isinstance(module, nn.Linear):
             return self._extract_dense(path, module, model)
         if isinstance(module, HeadLatentCommunication):
             return self._extract_latent(path, module)
-        raise ValueError(f"communication-state does not support module {path!r} of type {type(module).__name__}")
+        raise ValueError(
+            f"communication-state does not support module {path!r} of type {type(module).__name__}; "
+            "expected nn.Linear or HeadLatentCommunication"
+        )
 
     def _extract_dense(self, path: str, module: nn.Linear, model: nn.Module) -> dict[str, Any]:
         weight = module.weight.detach().to(dtype=torch.float64)
+        if weight.shape[0] != weight.shape[1]:
+            raise ValueError(f"dense communication block {path!r} must be square, got shape {list(weight.shape)}")
         identity = torch.eye(weight.shape[0], dtype=weight.dtype)
         difference = weight - identity
         head_dim = self.head_dim or getattr(model, "head_dim", None)

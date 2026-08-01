@@ -52,9 +52,9 @@ def test_training_with_profile_probes_writes_probe_artifacts(tmp_path: Path) -> 
     )
     probe_dir = tmp_path / "artifacts" / "probes"
     recorder = JsonlRecorder(probe_dir)
-    manifest = build_manifest(config, source_paths={probe.name: "profile" for probe in config.probes})
+    manifest = build_manifest(config, model, source_paths={probe.name: "profile" for probe in config.probes})
     reference = _batches(2, rows=4)
-    hook = build_probe_hook(config, recorder, reference_factory=lambda: reference, manifest=manifest)
+    hook = build_probe_hook(config, recorder, reference_factory=lambda: reference)
     assert hook is not None
 
     trainer = Trainer(
@@ -74,6 +74,11 @@ def test_training_with_profile_probes_writes_probe_artifacts(tmp_path: Path) -> 
         "communication-state",
         "activation-stats",
     ]
+    communication_entry = manifest_content["probes"][0]
+    assert communication_entry["matched_modules"] == ["latent_communications.0"]
+    activation_points = manifest_content["probes"][1]["points"]
+    assert activation_points[0]["pattern"] == "latent_communications.*"
+    assert activation_points[0]["matched_modules"] == ["latent_communications.0"]
 
     communication = [json.loads(line) for line in (probe_dir / "communication-state.jsonl").read_text().splitlines()]
     assert [(record["phase"], record["epoch"]) for record in communication] == [

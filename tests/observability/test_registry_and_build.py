@@ -81,40 +81,51 @@ def test_build_probe_hook_constructs_probes_and_binds_schedules(tmp_path: Path) 
     assert hook.probes[0][1] == ScheduleConfig(every_n_epochs=2)
 
 
-def test_build_probe_hook_forwards_reference_factory_and_manifest(tmp_path: Path) -> None:
+def test_build_probe_hook_forwards_reference_factory(tmp_path: Path) -> None:
     registry = ProbeRegistry()
     registry.register("activation-stats", lambda options: StubProbe("activation-stats", {"ok": True}))
     config = ResolvedObservabilityConfig(
         reference=ReferenceConfig(split="val", batches=8),
         probes=(ProbeConfig(name="activation-stats", points=(), schedule=ScheduleConfig(every_n_epochs=1)),),
     )
-    manifest = build_manifest(config, source_paths={})
 
     hook = build_probe_hook(
         config,
         JsonlRecorder(tmp_path / "probes"),
         registry=registry,
         reference_factory=lambda: ("batch-a",),
-        manifest=manifest,
     )
 
+    assert hook is not None
     assert hook.reference_factory is not None
-    from goldfish.observability.events import HookContext
 
-    hook.on_fit_start(HookContext(model=None, optimizer=None, scheduler=None, epoch=None, global_step=0, result=None, phase="fit_start"))  # type: ignore[arg-type]
-    assert (tmp_path / "probes" / "manifest.json").is_file()
+
+def test_build_probe_hook_rejects_activation_probe_without_reference_provider(tmp_path: Path) -> None:
+    registry = ProbeRegistry()
+    registry.register("activation-stats", lambda options: StubProbe("activation-stats", {"ok": True}))
+    config = ResolvedObservabilityConfig(
+        reference=None,
+        probes=(ProbeConfig(name="activation-stats", points=(), schedule=ScheduleConfig(every_n_epochs=1)),),
+    )
+
+    with pytest.raises(ValueError, match="reference provider"):
+        build_probe_hook(config, JsonlRecorder(tmp_path / "probes"), registry=registry)
 
 
 def test_build_manifest_contains_reference_and_probe_options() -> None:
+    from torch import nn
+
+    model = nn.Module()
     config = ResolvedObservabilityConfig(
         reference=ReferenceConfig(split="test", batches=4),
         probes=(ProbeConfig(name="mixer-state", include=("mixer",), include_grad_norms=True),),
     )
 
-    manifest = build_manifest(config, source_paths={"mixer-state": "profile"})
+    manifest = build_manifest(config, model, source_paths={"mixer-state": "profile"}, split_fingerprint="sha256:abc")
 
     assert manifest["schema_version"] == 2
-    assert manifest["reference"] == {"split": "test", "batches": 4, "selection": "first"}
+    assert manifest["reference"] == {"split": "test", "batches": 4, "selection": "first", "split_fingerprint": "sha256:abc"}
     assert manifest["probes"][0]["name"] == "mixer-state"
     assert manifest["probes"][0]["patterns"] == ["mixer"]
+    assert manifest["probes"][0]["matched_modules"] == []
     assert manifest["probes"][0]["source"] == "profile"

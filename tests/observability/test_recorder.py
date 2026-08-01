@@ -65,8 +65,18 @@ def test_write_manifest_writes_json_file(tmp_path: Path) -> None:
 def test_recorder_rejects_non_json_payload(tmp_path: Path) -> None:
     recorder = JsonlRecorder(tmp_path / "artifacts" / "probes")
 
-    with pytest.raises(TypeError):
+    with pytest.raises((TypeError, ValueError)):
         recorder.write_record("mixer-state", "epoch_end", 1, 1, {"matrix": torch.zeros(4, 4)})
+
+    path = tmp_path / "artifacts" / "probes" / "mixer-state.jsonl"
+    assert not path.exists()
+
+
+def test_recorder_rejects_nan_values(tmp_path: Path) -> None:
+    recorder = JsonlRecorder(tmp_path / "artifacts" / "probes")
+
+    with pytest.raises(ValueError):
+        recorder.write_record("mixer-state", "epoch_end", 1, 1, {"ratio": float("nan")})
 
     path = tmp_path / "artifacts" / "probes" / "mixer-state.jsonl"
     assert not path.exists()
