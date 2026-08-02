@@ -134,6 +134,7 @@ Model architectures are selected with a required YAML profile:
 --model-profile model-profiles/language/gru-small.yaml
 --model-profile model-profiles/forecast/lstm-small.yaml
 --model-profile model-profiles/forecast/multihead-lstm-small.yaml
+--model-profile model-profiles/forecast/deltanet-small.yaml  # DeltaNet fast-weight memory encoder
 ```
 
 Profiles supply architecture-owned parameters and model registry identity. Goldfish injects data-derived dimensions (vocabulary size or numeric feature/target/horizon counts), then saves the complete resolved model configuration in the run. This keeps new model-specific hyperparameters out of the training CLI.
@@ -300,6 +301,8 @@ uv run goldfish train data/fourier-lb256 \
 |---|---:|---|
 | `--observability` | off | Enable the probes declared by the model profile. |
 | `--observability-batches` | `8` | Reference batches captured from the validation split for activation probes. |
+
+If the validation split yields fewer batches than `--observability-batches`, training fails at start with an error naming the available count; reduce the value accordingly (the reference set must be identical across runs, so Goldfish never silently captures fewer batches than configured).
 
 Three probe kinds exist (see [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the full specification):
 

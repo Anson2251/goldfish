@@ -6,7 +6,7 @@ import torch
 from torch import Tensor, nn
 
 from goldfish.core import ModelOutput
-from goldfish.models.components import DoublyStochasticMixer, GRUBackbone, HeadLatentCommunication, LSTMBackbone, UnconstrainedMixer
+from goldfish.models.components import DeltaNetBackbone, DoublyStochasticMixer, GRUBackbone, HeadLatentCommunication, LSTMBackbone, UnconstrainedMixer
 
 
 class ForecastBatch(Protocol):
@@ -18,7 +18,7 @@ class ForecastBatch(Protocol):
 class _RecurrentForecastModel(nn.Module):
     """Encode a history and project its final recurrent state to all horizons."""
 
-    backbone: GRUBackbone | LSTMBackbone
+    backbone: GRUBackbone | LSTMBackbone | DeltaNetBackbone
 
     def __init__(self, feature_count: int, target_count: int, horizon_count: int, hidden_dim: int) -> None:
         super().__init__()
@@ -53,6 +53,39 @@ class LSTMForecastModel(_RecurrentForecastModel):
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
         self.backbone = LSTMBackbone(feature_count, hidden_dim, num_layers=num_layers, dropout=dropout)
+
+
+class DeltaNetForecastModel(_RecurrentForecastModel):
+    """DeltaNet fast-weight encoder with a multi-horizon point-forecast projection head.
+
+    The backbone runs the delta-rule update over the history window; the
+    per-position output at the final history position summarizes the written
+    memory and is projected to all horizons.
+    """
+
+    def __init__(
+        self,
+        feature_count: int,
+        target_count: int,
+        horizon_count: int,
+        hidden_dim: int,
+        *,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        short_conv_kernel: int = 4,
+        beta_initial_logit: float = 4.0,
+    ) -> None:
+        super().__init__(feature_count, target_count, horizon_count, hidden_dim)
+        self.backbone = DeltaNetBackbone(
+            feature_count,
+            hidden_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+            short_conv_kernel=short_conv_kernel,
+            beta_initial_logit=beta_initial_logit,
+        )
 
 
 class _MultiHeadLSTMForecastModel(nn.Module):

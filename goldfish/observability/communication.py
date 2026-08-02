@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -56,7 +55,7 @@ class CommunicationStateProbe:
         weight = module.weight.detach().to(dtype=torch.float64)
         if weight.shape[0] != weight.shape[1]:
             raise ValueError(f"dense communication block {path!r} must be square, got shape {list(weight.shape)}")
-        identity = torch.eye(weight.shape[0], dtype=weight.dtype)
+        identity = torch.eye(weight.shape[0], dtype=weight.dtype, device=weight.device)
         difference = weight - identity
         head_dim = self.head_dim or getattr(model, "head_dim", None)
         entry: dict[str, Any] = {
@@ -110,7 +109,7 @@ class CommunicationStateProbe:
 def _block_norms(weight: Tensor, head_dim: int) -> tuple[float, tuple[float, float]]:
     """Return (mean diagonal deviation, (mean, max) cross-head norms)."""
     num_blocks = weight.shape[0] // head_dim
-    identity = torch.eye(head_dim, dtype=weight.dtype)
+    identity = torch.eye(head_dim, dtype=weight.dtype, device=weight.device)
     diagonal: list[float] = []
     cross: list[float] = []
     for row in range(num_blocks):

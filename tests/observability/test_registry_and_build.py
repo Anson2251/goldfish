@@ -54,8 +54,11 @@ def test_take_first_batches_returns_configured_count() -> None:
 
 
 def test_take_first_batches_fails_when_split_is_too_short() -> None:
-    with pytest.raises(ValueError, match="fewer than 3"):
+    with pytest.raises(ValueError, match="configured 3") as error:
         take_first_batches(iter(["only"]), 3)
+
+    assert "yielded 1 batch" in str(error.value)
+    assert "observability-batches" in str(error.value)
 
 
 def test_build_probe_hook_returns_none_without_probes(tmp_path: Path) -> None:

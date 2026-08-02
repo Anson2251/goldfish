@@ -99,7 +99,7 @@ class MixerStateProbe:
 
 
 def _matrix_statistics(matrix: Tensor) -> dict[str, Any]:
-    identity = torch.eye(matrix.shape[0], dtype=matrix.dtype)
+    identity = torch.eye(matrix.shape[0], dtype=matrix.dtype, device=matrix.device)
     difference = matrix - identity
     return {
         "frobenius_distance_to_identity": float(difference.norm()),
@@ -113,7 +113,7 @@ def _matrix_statistics(matrix: Tensor) -> dict[str, Any]:
     }
 
 
-def _grad_norm(parameter: nn.Parameter) -> float | None:
+def _grad_norm(parameter: nn.Parameter | torch.Tensor) -> float | None:
     if parameter.grad is None:
         return None
     return float(parameter.grad.detach().norm())

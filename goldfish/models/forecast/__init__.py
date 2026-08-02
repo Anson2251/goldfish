@@ -1,5 +1,5 @@
 """Numeric forecasting model compositions."""
 
-from .recurrent import ForecastBatch, GRUForecastModel, InterLayerCommunicationMultiHeadLSTMForecastModel, LSTMForecastModel, LatentCommunicationMultiHeadLSTMForecastModel, MultiHeadLSTMForecastModel, UnconstrainedMultiHeadLSTMForecastModel
+from .recurrent import DeltaNetForecastModel, ForecastBatch, GRUForecastModel, InterLayerCommunicationMultiHeadLSTMForecastModel, LSTMForecastModel, LatentCommunicationMultiHeadLSTMForecastModel, MultiHeadLSTMForecastModel, UnconstrainedMultiHeadLSTMForecastModel
 
-__all__ = ["ForecastBatch", "GRUForecastModel", "InterLayerCommunicationMultiHeadLSTMForecastModel", "LSTMForecastModel", "LatentCommunicationMultiHeadLSTMForecastModel", "MultiHeadLSTMForecastModel", "UnconstrainedMultiHeadLSTMForecastModel"]
+__all__ = ["DeltaNetForecastModel", "ForecastBatch", "GRUForecastModel", "InterLayerCommunicationMultiHeadLSTMForecastModel", "LSTMForecastModel", "LatentCommunicationMultiHeadLSTMForecastModel", "MultiHeadLSTMForecastModel", "UnconstrainedMultiHeadLSTMForecastModel"]

@@ -32,6 +32,7 @@ Current registrations:
 | `language` | `lstm` | `LSTMLanguageModel` |
 | `forecast` | `gru` | `GRUForecastModel` |
 | `forecast` | `lstm` | `LSTMForecastModel` |
+| `forecast` | `deltanet` | `DeltaNetForecastModel` |
 | `forecast` | `multihead-lstm` | `MultiHeadLSTMForecastModel` |
 
 Create a configured model with:
@@ -69,6 +70,8 @@ Forward results are:
 | LSTM | `[B, T, H]` | `(hidden, cell)`, each `[num_layers, B, H]` |
 
 Both accept an optional compatible previous state. This enables incremental text generation without reprocessing the full generated prefix.
+
+`DeltaNetBackbone` (in `goldfish.models.components.deltanet`) is the third recurrent backbone; it is a fast-weight memory rather than a hidden-vector RNN and is described with its forecast model below.
 
 ## Language models
 
@@ -193,6 +196,56 @@ The parameter logits are projected in log space through iterative Sinkhorn norma
 The model runs `num_heads` independent LSTMs. Each head projects and LayerNorms the common numeric input, produces a `head_dim = hidden_dim / num_heads` state sequence, and then stacks the states as `[B, L, num_heads, head_dim]`. `DoublyStochasticMixer` mixes the head dimension before the mixed heads are concatenated and fused into `[B, L, hidden_dim]`. The final time position is projected to the standard `[B, horizon_count, target_count]` forecast.
 
 `hidden_dim` must be divisible by `num_heads`. The `multihead-lstm` registry model accepts `num_heads` (CLI: `--lstm-heads`, default `4`) and `sinkhorn_iterations` (CLI: `--sinkhorn-iterations`, default `20`). Do not mean-pool the mixer output over heads: double stochasticity preserves this mean exactly, making such a readout independent of the mixer.
+
+## DeltaNet forecast model
+
+**Implementation:** `DeltaNetForecastModel` in `goldfish.models.forecast.recurrent`, with `DeltaNetBackbone` and the `delta_rule_scan` primitive in `goldfish.models.components.deltanet`
+
+DeltaNet (Schlag et al., 2021; Yang et al., 2024) is linear attention with an error-correcting delta-rule memory. Each head maintains a matrix-valued fast-weight memory `S` in `R^{head_dim x head_dim}` updated per position as:
+
+```text
+S_t = S_{t-1} - beta_t (S_{t-1} k_t - v_t) k_t^T
+o_t = S_t q_t
+```
+
+`beta_t` is a learnable per-head scalar in `(0, 1)` (sigmoid of a logit, initialized near one) acting as the delta-rule learning rate: the update erases the old association for key `k_t` and writes a blended replacement. With unit-norm keys, the transition `I - k k^T` is a projection that removes only the direction of `k`, keeping interference between stored associations low.
+
+### Constructor
+
+```python
+DeltaNetForecastModel(
+    feature_count: int,
+    target_count: int,
+    horizon_count: int,
+    hidden_dim: int,
+    *,
+    num_heads: int = 4,
+    num_layers: int = 1,
+    dropout: float = 0.0,
+    short_conv_kernel: int = 4,
+    beta_initial_logit: float = 4.0,
+)
+```
+
+`hidden_dim` must be divisible by `num_heads`. Each layer is a pre-norm residual block: LayerNorm, fused query/key/value projection, causal depthwise short convolution over the concatenated channels (`short_conv_kernel = 1` disables it), SiLU activation, L2 normalization of queries and keys, the delta-rule scan over the history, output RMSNorm, and an output projection. `dropout` applies between layers only, like the torch recurrent backbones. The first layer consumes `feature_count` inputs without a residual; subsequent layers consume and residual-connect `hidden_dim`.
+
+### Batch and output
+
+The forward path requires `inputs: Tensor  # [B, L, F]` and returns:
+
+```python
+ModelOutput(
+    predictions={"forecast": forecast},    # [B, H, C]
+    representations=states,                  # [B, L, hidden_dim]
+)
+```
+
+The backbone additionally exposes the final fast-weight memory `S_L` with shape `[B, num_heads, head_dim, head_dim]` as its state; the forecast head reads the per-position output at history position `L - 1`. Profile example:
+
+```sh
+uv run goldfish train data/fourier \
+  --model-profile model-profiles/forecast/deltanet-small.yaml
+```
 
 ## Model profiles and configuration
 
