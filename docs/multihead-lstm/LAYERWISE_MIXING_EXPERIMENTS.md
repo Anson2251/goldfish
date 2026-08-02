@@ -199,7 +199,9 @@ A seed sweep is especially important because the currently observed advantage of
 
 ## Current working conclusion
 
-Layerwise mixing is the leading architectural direction for this multi-head LSTM. On the available `fourier-lb256` run, it substantially improves over output-only mixing and reaches the single-LSTM reference. The result is promising but does not yet isolate whether the gain comes from learnable cross-head routing, identity-preserving layerwise execution, or ordinary run-to-run variation.
+**Superseded by the `exp104` replication below.** Layerwise mixing was the leading architectural direction for this multi-head LSTM. On the available `fourier-lb256` run, it substantially improved over output-only mixing and reached the single-LSTM reference. The result was promising but did not yet isolate whether the gain came from learnable cross-head routing, identity-preserving layerwise execution, or ordinary run-to-run variation.
+
+The same-architecture, same-configuration rerun with probes (`exp104`, `0.02124` best validation loss versus `exp79`'s `0.00705`) did not reproduce the gain, and a code audit plus checkpoint reproduction confirmed the two runs are model-equivalent. The layerwise advantage is therefore currently best explained as run-to-run variation; see the `exp104` UPDATE section below for details.
 
 ---
 
@@ -680,5 +682,123 @@ The routing logits become clearly non-uniform, whereas gates remain small. This 
 3. **The small residual gate is a plausible regularizer.** In contrast to the strongly non-identity dense transform in `exp86`, `exp87` preserves a small communication injection while allowing encoders and decoders to learn feature translation. This is consistent with its better second-cycle validation trajectory, but does not establish causality.
 
 4. **`exp79` remains unexplained.** The latent design is more expressive and produces directly observable communication, but it does not reproduce the shared near-identity mixer's `0.00705` result. One seed per condition remains a material confound.
+
+---
+
+## UPDATE: Same-configuration reproduction with probes (exp104)
+
+### Motivation
+
+The most direct test of the `exp79` result is a same-architecture, same-configuration rerun. `exp104` repeats the `exp79` model and training configuration exactly, with probe observability enabled. It is the first rerun of the layerwise identity-init configuration since `exp79`, and the first run with a full per-epoch record of the mixer state.
+
+### Setup
+
+`exp104` uses the `exp79` configuration verbatim (see the table below) plus an observability block:
+
+```yaml
+model:
+  family: forecast
+  name: multihead-lstm
+  parameters:
+    hidden_dim: 32
+    num_layers: 2
+    dropout: 0.0
+    num_heads: 4
+    sinkhorn_iterations: 20
+
+observability:
+  enabled: true
+  reference:
+    split: val
+    batches: 2
+    selection: first
+  probes:
+    probes:
+    - name: mixer-state
+      every_n_epochs: 1
+      include_grad_norms: true
+    - name: activation-stats
+      points:
+      - path: mixer
+        quantity: mixing-displacement
+      every_n_epochs: 1
+```
+
+The run environment records Git commit `4877486a7e5e5b75553a6cfd7b1b203b64cd7869` and `git_dirty: true`; the working-tree changes are observability-only and do not touch model or training code. Dataset fingerprint `ebe1ebc2...`, normalizer fingerprint `e08805bd...`, and all split fingerprints match `exp79` exactly. `seed: null`, `deterministic: false`, AdamW `lr=0.001`/`weight_decay=0.0001`, cosine `t_max=500`, 1,000 epochs: all identical to `exp79`.
+
+### Results
+
+| Run | Mixer init / position | Best validation loss | Best epoch | Final validation loss |
+|---|---|---:|---:|---:|
+| `exp79` | identity, layerwise, shared | **`0.00705`** | 913 | **`0.00893`** |
+| `exp104` | identity, layerwise, shared (+ probes) | `0.02124` | 998 | `0.03375` |
+
+Same architecture, same configuration, one added observability layer: best validation loss degrades by a factor of `3.0×` (`0.00705 → 0.02124`), and final validation loss by `3.8×` (`0.00893 → 0.03375`). `exp104` also finishes below the output-only constrained baseline `exp73` (`0.01584` best) and the dense-communication run `exp86` (`0.02003` best).
+
+### Training trajectory
+
+| Epoch | `exp79` train / validation | `exp104` train / validation |
+|---:|---:|---:|
+| 1 | `1.01938 / 1.60837` | `0.94748 / 1.86108` |
+| 10 | `0.35377 / 0.48669` | `0.30016 / 0.41768` |
+| 50 | `0.17252 / 0.20267` | `0.19540 / 0.21673` |
+| 100 | `0.05885 / 0.08763` | `0.07101 / 0.10135` |
+| 250 | `0.01197 / 0.03041` | `0.03245 / 0.07396` |
+| 500 | `0.00604 / 0.01812` | `0.02407 / 0.05094` |
+| 750 | `0.00496 / 0.01850` | `0.01978 / 0.04143` |
+| 1000 | `0.00469 / 0.00893` | `0.01434 / 0.03375` |
+
+The runs separate early: at epoch 1 `exp104` has lower training loss but higher validation loss, and the validation gap grows through the first cosine cycle. `exp79` improves substantially in the second cycle (epochs 500–1000), while `exp104` makes only marginal progress (`0.05094 → 0.03375`). `exp104` also shows late-cycle validation instability not present in `exp79`: between epochs 993 and 1000 validation loss swings between `0.021` and `0.043` while training loss stays near `0.014`–`0.020`.
+
+### Mixer probe trajectory
+
+The `mixer-state` probe records the projected matrix, logits, and logit grad norms at every epoch (`runs/exp104/artifacts/probes/mixer-state.jsonl`):
+
+| Epoch | Total off-diagonal mass | Frobenius distance to I | Logits distance to initial | Logit grad norm |
+|---|---:|---:|---:|---:|
+| 0 (init) | `5.45e-4` | `3.15e-4` | `0.0000` | — |
+| 1 | `5.48e-4` | `3.16e-4` | `0.0328` | `9.8e-6` |
+| 50 | `5.05e-4` | `2.92e-4` | `0.2101` | `1.6e-5` |
+| 100 | `4.98e-4` | `2.88e-4` | `0.2631` | `9.2e-5` |
+| 250 | `4.96e-4` | `2.87e-4` | `0.3274` | `9.0e-5` |
+| 500 | `4.97e-4` | `2.88e-4` | `0.3681` | `2.2e-5` |
+| 1000 | `4.96e-4` | `2.87e-4` | `0.4125` | `9.2e-5` |
+
+The projected matrix never leaves the near-identity neighborhood: total off-diagonal mass stays between `5.5e-4` and `5.0e-4` for the entire run. The logits do move (`0 → 0.41` distance), but the log-space Sinkhorn projection compresses these moves into a projected matrix that changes only in the fourth decimal place. Logit gradient norms are small throughout (`1e-5` to `2e-4`). The `activation-stats` probe reports a mixing displacement ratio of about `1.6e-4` on the reference batches, consistent with a mixer that injects negligible cross-head signal.
+
+### Code audit: no behavioral change between exp79 and exp104
+
+Git history between the `exp79` environment commit (`a7f9eab`, layerwise change uncommitted in the working tree) and the `exp104` commit (`4877486`) was audited for the model, training, task, and data paths:
+
+- `models/components/mixing.py`: only added `diagnostics()` and the optional `initialization`/`random_std`/`uniform_ratio` parameters; the identity init (`logits = eye(N) * 10`) and Sinkhorn projection are unchanged.
+- `models/forecast/recurrent.py`: the layerwise forward introduced by commit `36c31fb` is unchanged in behavior; later commits only add optional mixer-initialization/distinct-mixer arguments and new model classes.
+- `training/trainer.py`: only added a `hooks` parameter and three no-op hook calls.
+- `train.py`: only observability wiring.
+- `tasks/`, `core/task.py`, `data/`, `experiments/`: zero commits between `a7f9eab` and HEAD.
+
+As a direct compatibility check, both `exp79` checkpoints were loaded with the current HEAD model code and re-evaluated on the current validation split:
+
+| Checkpoint | Reported loss | Reproduced loss | `load_state_dict` |
+|---|---:|---:|---|
+| `exp79` best (epoch 912) | `0.007049` | `0.007025` | `missing=[] unexpected=[]` |
+| `exp79` final (epoch 999) | `0.008930` | `0.008892` | `missing=[] unexpected=[]` |
+
+Both losses reproduce to within `3e-5`, and the state dict loads strictly with no missing or unexpected keys. The model code, data, and loss path at HEAD are therefore equivalent to the `exp79` runtime.
+
+### Interpretation
+
+1. **The `exp79` result is likely a favorable seed.** The same architecture and configuration rerun (`exp104`) produces a best validation loss `3.0×` worse, below the output-only baseline. With model behavior verified equivalent via checkpoint reproduction, the remaining differences are the random initialization (both runs use `seed: null`) and the observability layer. Probes are gradient-free observations that do not modify the optimizer state, so the dominant explanation is initialization/training-path variation.
+
+2. **The delayed-coupling hypothesis (H5) is not supported by the observed trajectory.** The `exp104` mixer never deviated from near-identity at any recorded epoch; there is no evidence of an early routing excursion that later returns to identity. Since the final mixer is nearly identical between `exp79` and `exp104` while performance differs by `3.0×`, mixer behavior does not explain the performance difference.
+
+3. **The gradient-channel hypothesis (H1) is weakened.** The `exp104` mixer logits received gradients and moved (`0 → 0.41` logits distance) throughout training, yet the run did not obtain the `exp79` gain. A live gradient path through the mixer is therefore not sufficient to explain the `exp79` advantage; if it matters at all, it requires a specific head-initialization path to act on.
+
+4. **The claimed layerwise gain is not reproduced.** The `exp79` vs `exp73` comparison (`0.00705` vs `0.01584`, a 55% improvement) was previously the leading architectural result. `exp104` (`0.02124`) is worse than `exp73`, so the layerwise improvement does not replicate on a second trajectory. The layerwise identity-init architecture remains a promising but unproven direction; the single-trajectory evidence no longer supports presenting it as a stable improvement.
+
+5. **Robust findings that survive this replication:** within the same run mechanism, identity initialization versus random/uniform initialization (`exp80`/`exp81` vs `exp79`, `6.9×`/`5.2×`) is a large effect that seed noise of this magnitude (`3.0×`) cannot explain. The final near-identity mixer in both `exp79` and `exp104` also reinforces that the learned mixer is an observer of, not a driver of, the outcome.
+
+### Next steps
+
+A multi-seed sweep is now the required foundation: rerun the `exp79` configuration, the `exp73` configuration, and the single-LSTM reference over a fixed seed set (3–5 seeds each) with probes enabled, and compare best/final validation loss distributions and mixer trajectories. This will determine whether the `exp79` configuration's median lands near `0.007` or near `0.02`, and will settle whether any layerwise advantage exists at all.
 
 ---

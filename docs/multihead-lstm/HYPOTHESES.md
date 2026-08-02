@@ -18,8 +18,9 @@ This document records the explanatory hypotheses generated during the multi-head
 
 **Contradictions / open questions:**
 - If gradient coupling is the key mechanism, freezing the mixer or communication block after epoch N should cause performance to collapse when N is small but remain stable when N is large. No such experiment has been run.
+- `exp104` (same architecture and configuration as `exp79`, only with probes) receives gradients on its mixer logits throughout training and moves them (`0 → 0.41` logits distance), yet performs `3.0×` worse than `exp79`. A live gradient path is therefore not sufficient to produce the `exp79` gain. If gradient coupling matters, it requires a specific head-initialization path to act on.
 
-**Status:** Plausible, not directly tested.
+**Status:** Weakened by `exp104`; a live mixer gradient path exists without reproducing the gain.
 
 **Validation experiments:**
 1. Freeze mixer at epoch 50, 100, 250, 500; compare final performance. If early freeze ≈ bad and late freeze ≈ good, gradient coupling during early training is critical.
@@ -107,8 +108,9 @@ This document records the explanatory hypotheses generated during the multi-head
 
 **Contradictions / open questions:**
 - We do not have intermediate mixer checkpoints for `exp79`. We cannot verify whether the mixer actually deviated from identity during epochs 1–250.
+- `exp104` records the full mixer trajectory of the same architecture and configuration: the projected matrix never leaves the near-identity neighborhood (off-diagonal mass `5.5e-4 → 5.0e-4` over 1,000 epochs). No early routing excursion occurs. Since `exp104` does not reproduce the `exp79` gain, the delayed-coupling story is not supported by the only observed trajectory.
 
-**Status:** Highly plausible but critically dependent on unobserved trajectory data.
+**Status:** Not observed on the `exp104` trajectory; substantially weakened as an explanation for the `exp79` advantage, though the `exp79` trajectory itself remains unrecorded.
 
 **Validation experiments:**
 1. **Highest priority:** Reconstruct mixer trajectory from saved intermediate checkpoints, or re-run `exp79` with periodic checkpoint saving. If the mixer off-diag mass was ever > 0.01 during training, this hypothesis is strongly supported.
@@ -200,8 +202,9 @@ This document records the explanatory hypotheses generated during the multi-head
 **Evidence:**
 - `exp79` vs `exp78` is the only comparison where the gap is small enough to be within typical seed variation.
 - All other comparisons are large enough to be robust to seed jitter.
+- `exp104` is a direct same-architecture, same-configuration rerun of `exp79` (verified equivalent by checkpoint reproduction: both `exp79` checkpoints load strictly into HEAD code and reproduce reported losses to within `3e-5`). Best validation loss degrades `3.0×` (`0.00705 → 0.02124`). This is direct evidence that run-to-run variation is a material confound for the `exp79` result.
 
-**Status:** Acknowledged uncertainty; does not invalidate other findings but weakens the "multihead is better than single LSTM" claim.
+**Status:** Supported by the `exp104` replication; the `exp79` result must be treated as one trajectory until a seed sweep is run.
 
 **Validation experiments:**
 1. Seed sweep for `exp79`, `exp78`, and `exp73` (minimum 3–5 seeds each). Report mean ± std for best validation loss.
@@ -234,24 +237,26 @@ This document records the explanatory hypotheses generated during the multi-head
 
 | # | Hypothesis | Status | Key Missing Experiment |
 |---|---|---|---|
-| 1 | Gradient-channel | Plausible | Freeze communication at epoch N |
+| 1 | Gradient-channel | Weakened by `exp104` (gradient path active without gain) | Freeze communication at epoch N |
 | 2 | Premature bottleneck | Partially supported, revised | Gate-init / scheduled-message sweep |
 | 3 | Continuous coordinate-mixer landscape | Supported (coarse) | Uniform ratio sweep `0.01–0.2` |
 | 4 | Representation-locking | Strongly supported | Mixer reset at mid-training |
-| 5 | Delayed coupling | Highly plausible, unverified | Intermediate `exp79` mixer trajectory |
+| 5 | Delayed coupling | Not observed on `exp104` trajectory; weakened | `exp79` intermediate mixer trajectory |
 | 6 | Shared-mixer constraint | Weakened by `exp84` | Multi-seed shared vs distinct comparison |
 | 7 | Single-layer stacking | Unresolved; insufficient alone | `num_heads=1` layerwise baseline |
 | 8 | Learnability-as-freedom | Needs test | Fixed-identity control |
 | 9 | Residual regularization | Speculative | Gradient/message magnitude analysis |
-| 10 | Seed variation | Acknowledged | Multi-seed sweep |
+| 10 | Seed variation | **Supported by `exp104` replication (`3.0×` gap)** | Multi-seed sweep |
 | 11 | Translate-route-decode | Promising, one trajectory | Routing / gate / MLP ablations |
 
 ---
 
 ## Recommended priority order for next experiments
 
-1. **Implement the planned probe system for communication residual magnitude** — record `||gate ⊙ D(m)|| / ||h||`, routing, and gates through training.
-2. **Seed sweep for `exp79`, `exp78`, `exp73`, and `exp87`** — establish which reported gaps are stable.
+The `exp104` replication (same architecture/configuration as `exp79`, verified code-equivalent, `3.0×` worse) elevates seed variation from an acknowledged uncertainty to a supported confound. Until a seed sweep is run, every single-trajectory comparison in this document — including the layerwise gain itself — should be treated as an observation rather than a result.
+
+1. **Seed sweep for `exp79`, `exp73`, `exp78`** — now the single most important experiment; establish the distribution of best/final validation loss under the layerwise identity-init configuration (expected median near `0.02`, not `0.007`, given `exp104`). Run with probes enabled to collect mixer trajectories across seeds.
+2. **Implement the planned probe system for communication residual magnitude** — record `||gate ⊙ D(m)|| / ||h||`, routing, and gates through training.
 3. **Fixed-uniform-routing latent communication** — isolate learned receiver routing from source/destination MLP capacity.
 4. **`num_heads=1` layerwise baseline** — isolate explicit stacked-LSTM effects.
-5. **Intermediate mixer trajectory for `exp79`** — determine whether its final near-identity state hides meaningful training-time excursions.
+5. **Intermediate mixer trajectory for `exp79`** — now lower priority, since the observed `exp104` trajectory shows no excursion; useful only to rule out an `exp79`-specific path.
