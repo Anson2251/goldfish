@@ -1,0 +1,10 @@
+schema_version: 1
+model:
+  family: forecast
+  name: linear-lstm
+  parameters:
+    hidden_dim: 32
+    projection_dim: 32
+    projection_bias: true
+    num_layers: 1
+    dropout: 0.0

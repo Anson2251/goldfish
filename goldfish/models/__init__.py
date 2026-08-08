@@ -1,7 +1,7 @@
 """Model components and modality-specific model compositions."""
 
 from .components import DeltaNetBackbone, DoublyStochasticMixer, GRUBackbone, LSTMBackbone, RecurrentState, UnconstrainedMixer, delta_rule_scan
-from .forecast import DeltaNetForecastModel, GRUForecastModel, InterLayerCommunicationMultiHeadLSTMForecastModel, LSTMForecastModel, LatentCommunicationMultiHeadLSTMForecastModel, MultiHeadLSTMForecastModel, UnconstrainedMultiHeadLSTMForecastModel
+from .forecast import ConvLSTMForecastModel, DeltaNetForecastModel, GRUForecastModel, InterLayerCommunicationMultiHeadLSTMForecastModel, LinearLSTMForecastModel, LSTMForecastModel, LatentCommunicationMultiHeadLSTMForecastModel, MultiHeadLSTMForecastModel, UnconstrainedMultiHeadLSTMForecastModel
 from .language import GRULanguageModel, LSTMLanguageModel, TokenBatch
 from .registry import ModelRegistry, model_registry
 
@@ -9,6 +9,8 @@ model_registry.register("language", "gru", GRULanguageModel)
 model_registry.register("language", "lstm", LSTMLanguageModel)
 model_registry.register("forecast", "gru", GRUForecastModel)
 model_registry.register("forecast", "lstm", LSTMForecastModel)
+model_registry.register("forecast", "conv-lstm", ConvLSTMForecastModel)
+model_registry.register("forecast", "linear-lstm", LinearLSTMForecastModel)
 # Compatibility alias for managed runs created before model profiles.
 model_registry.register("forecast", "lstm-128x2", LSTMForecastModel)
 model_registry.register("forecast", "deltanet", DeltaNetForecastModel)
@@ -19,6 +21,7 @@ model_registry.register("forecast", "multihead-lstm-communication", InterLayerCo
 model_registry.register("forecast", "multihead-lstm-latent-communication", LatentCommunicationMultiHeadLSTMForecastModel)
 
 __all__ = [
+    "ConvLSTMForecastModel",
     "DeltaNetBackbone",
     "DeltaNetForecastModel",
     "DoublyStochasticMixer",
@@ -28,6 +31,7 @@ __all__ = [
     "GRUForecastModel",
     "InterLayerCommunicationMultiHeadLSTMForecastModel",
     "LatentCommunicationMultiHeadLSTMForecastModel",
+    "LinearLSTMForecastModel",
     "LSTMBackbone",
     "LSTMForecastModel",
     "LSTMLanguageModel",

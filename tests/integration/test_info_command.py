@@ -35,3 +35,27 @@ def test_info_prints_forecast_profile_summary(capsys) -> None:
     assert "Model:   forecast/multihead-lstm" in output
     assert "Total params:" in output
     assert "MultiHeadLSTMForecastModel" in output
+
+
+def test_info_prints_conv_lstm_forecast_profile_summary(capsys) -> None:
+    main = _load_main()
+
+    assert main(["info", str(ROOT / "model-profiles" / "forecast" / "conv-lstm-small.yaml")]) == 0
+
+    output = capsys.readouterr().out
+    assert "Model:   forecast/conv-lstm" in output
+    assert "Total params:" in output
+    assert "Conv1d" in output
+    assert "LSTM" in output
+
+
+def test_info_prints_linear_lstm_forecast_profile_summary(capsys) -> None:
+    main = _load_main()
+
+    assert main(["info", str(ROOT / "model-profiles" / "forecast" / "linear-lstm-small.yaml")]) == 0
+
+    output = capsys.readouterr().out
+    assert "Model:   forecast/linear-lstm" in output
+    assert "Total params:" in output
+    assert "Linear" in output
+    assert "LSTM" in output

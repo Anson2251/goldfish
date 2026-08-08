@@ -1,0 +1,17 @@
+model:
+  family: forecast
+  name: conv-lstm
+  parameters:
+    hidden_dim: 32
+    conv_channels: 32
+
+    conv_kernel_size: 7
+    conv_stride: 4
+    conv_padding: 3
+
+    downsample_kernel_size: 3
+    downsample_stride: 2
+    downsample_padding: 1
+
+    num_layers: 1
+    dropout: 0.0

@@ -55,6 +55,127 @@ class LSTMForecastModel(_RecurrentForecastModel):
         self.backbone = LSTMBackbone(feature_count, hidden_dim, num_layers=num_layers, dropout=dropout)
 
 
+class ConvLSTMForecastModel(_RecurrentForecastModel):
+    """1D-convolutional feature encoder followed by an LSTM forecast model."""
+
+    def __init__(
+        self,
+        feature_count: int,
+        target_count: int,
+        horizon_count: int,
+        hidden_dim: int,
+        *,
+        conv_channels: int | None = None,
+        conv_kernel_size: int = 3,
+        conv_stride: int = 1,
+        conv_padding: int | str = "same",
+        conv_dilation: int = 1,
+        conv_groups: int = 1,
+        conv_bias: bool = True,
+        downsample_kernel_size: int | None = None,
+        downsample_stride: int = 1,
+        downsample_padding: int | str = "same",
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__(feature_count, target_count, horizon_count, hidden_dim)
+        conv_channels = hidden_dim if conv_channels is None else conv_channels
+        if conv_channels <= 0:
+            raise ValueError("conv_channels must be positive")
+        if conv_kernel_size <= 0:
+            raise ValueError("conv_kernel_size must be positive")
+        if conv_stride <= 0:
+            raise ValueError("conv_stride must be positive")
+        if conv_dilation <= 0:
+            raise ValueError("conv_dilation must be positive")
+        if conv_groups <= 0:
+            raise ValueError("conv_groups must be positive")
+        if feature_count % conv_groups != 0 or conv_channels % conv_groups != 0:
+            raise ValueError("conv_groups must divide feature_count and conv_channels")
+        if conv_padding == "same" and conv_stride != 1:
+            raise ValueError('conv_padding="same" requires conv_stride=1')
+        if downsample_kernel_size is not None and downsample_kernel_size <= 0:
+            raise ValueError("downsample_kernel_size must be positive")
+        if downsample_stride <= 0:
+            raise ValueError("downsample_stride must be positive")
+        if downsample_padding == "same" and downsample_stride != 1:
+            raise ValueError('downsample_padding="same" requires downsample_stride=1')
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+
+        self.conv = nn.Conv1d(
+            in_channels=feature_count,
+            out_channels=conv_channels,
+            kernel_size=conv_kernel_size,
+            stride=conv_stride,
+            padding=conv_padding,
+            dilation=conv_dilation,
+            groups=conv_groups,
+            bias=conv_bias,
+        )
+        self.encoder_activation = nn.SiLU()
+        self.downsample = (
+            nn.Conv1d(
+                conv_channels,
+                conv_channels,
+                kernel_size=downsample_kernel_size,
+                stride=downsample_stride,
+                padding=downsample_padding,
+            )
+            if downsample_kernel_size is not None
+            else None
+        )
+        self.backbone = LSTMBackbone(conv_channels, hidden_dim, num_layers=num_layers, dropout=dropout)
+
+    def forward(self, batch: ForecastBatch) -> ModelOutput:
+        if batch.inputs.ndim != 3:
+            raise ValueError("forecast inputs must have shape [batch, lookback, feature_count].")
+        convolved = self.conv(batch.inputs.transpose(1, 2))
+        if self.downsample is not None:
+            convolved = self.encoder_activation(convolved)
+            convolved = self.encoder_activation(self.downsample(convolved))
+        states, _ = self.backbone(convolved.transpose(1, 2))
+        forecast = self.forecast_head(states[:, -1]).reshape(
+            batch.inputs.shape[0], self.horizon_count, self.target_count
+        )
+        return ModelOutput(predictions={"forecast": forecast}, representations=states)
+
+
+class LinearLSTMForecastModel(_RecurrentForecastModel):
+    """Per-time-step linear feature projection followed by an LSTM forecast model."""
+
+    def __init__(
+        self,
+        feature_count: int,
+        target_count: int,
+        horizon_count: int,
+        hidden_dim: int,
+        *,
+        projection_dim: int | None = None,
+        projection_bias: bool = True,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__(feature_count, target_count, horizon_count, hidden_dim)
+        projection_dim = hidden_dim if projection_dim is None else projection_dim
+        if projection_dim <= 0:
+            raise ValueError("projection_dim must be positive")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+
+        self.projection = nn.Linear(feature_count, projection_dim, bias=projection_bias)
+        self.backbone = LSTMBackbone(projection_dim, hidden_dim, num_layers=num_layers, dropout=dropout)
+
+    def forward(self, batch: ForecastBatch) -> ModelOutput:
+        if batch.inputs.ndim != 3:
+            raise ValueError("forecast inputs must have shape [batch, lookback, feature_count].")
+        states, _ = self.backbone(self.projection(batch.inputs))
+        forecast = self.forecast_head(states[:, -1]).reshape(
+            batch.inputs.shape[0], self.horizon_count, self.target_count
+        )
+        return ModelOutput(predictions={"forecast": forecast}, representations=states)
+
+
 class DeltaNetForecastModel(_RecurrentForecastModel):
     """DeltaNet fast-weight encoder with a multi-horizon point-forecast projection head.
 
