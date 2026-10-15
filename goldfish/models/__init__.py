@@ -1,7 +1,7 @@
 """Model components and modality-specific model compositions."""
 
 from .components import DeltaNetBackbone, DoublyStochasticMixer, GRUBackbone, LSTMBackbone, RecurrentState, UnconstrainedMixer, delta_rule_scan
-from .forecast import ConvLSTMForecastModel, DeltaNetForecastModel, GRUForecastModel, InterLayerCommunicationMultiHeadLSTMForecastModel, LinearLSTMForecastModel, LSTMForecastModel, LatentCommunicationMultiHeadLSTMForecastModel, MultiHeadLSTMForecastModel, UnconstrainedMultiHeadLSTMForecastModel
+from .forecast import ConvLSTMForecastModel, DeltaNetForecastModel, GRUForecastModel, InterLayerCommunicationMultiHeadLSTMForecastModel, LinearLSTMForecastModel, LSTMForecastModel, LatentCommunicationMultiHeadLSTMForecastModel, MultiHeadLSTMForecastModel, RecursiveSelfModifyingForecastModel, UnconstrainedMultiHeadLSTMForecastModel
 from .language import GRULanguageModel, LSTMLanguageModel, TokenBatch
 from .registry import ModelRegistry, model_registry
 
@@ -14,6 +14,7 @@ model_registry.register("forecast", "linear-lstm", LinearLSTMForecastModel)
 # Compatibility alias for managed runs created before model profiles.
 model_registry.register("forecast", "lstm-128x2", LSTMForecastModel)
 model_registry.register("forecast", "deltanet", DeltaNetForecastModel)
+model_registry.register("forecast", "self-modifying", RecursiveSelfModifyingForecastModel)
 model_registry.register("forecast", "multihead-lstm", MultiHeadLSTMForecastModel)
 model_registry.register("forecast", "multihead-lstm-unconstrained", UnconstrainedMultiHeadLSTMForecastModel)
 model_registry.register("forecast", "multihead-lstm-distinct", MultiHeadLSTMForecastModel)
@@ -36,6 +37,7 @@ __all__ = [
     "LSTMForecastModel",
     "LSTMLanguageModel",
     "MultiHeadLSTMForecastModel",
+    "RecursiveSelfModifyingForecastModel",
     "UnconstrainedMultiHeadLSTMForecastModel",
     "ModelRegistry",
     "RecurrentState",

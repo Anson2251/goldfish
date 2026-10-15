@@ -60,6 +60,46 @@ locking: {dataset_lock: dataset-lock.json}
         (root / split / "01.csv").write_text(rows, encoding="utf-8")
 
 
+def test_self_modifying_profile_trains_and_exports_one_step_forecasts(tmp_path: Path) -> None:
+    dataset, runs = tmp_path / "dataset", tmp_path / "runs"
+    write_numeric_bundle(dataset)
+    assert load_entry("prepare")([str(dataset)]) == 0
+
+    assert load_entry("train")([
+        str(dataset), "--runs-dir", str(runs), "--name", "self-modifying", "--epochs", "1", "--batch-size", "2",
+        "--device", "cpu", "--num-workers", "0", "--deterministic", "--seed", "7",
+        "--model-profile", str(ROOT / "model-profiles" / "forecast" / "self-modifying-small.yaml"),
+    ]) == 0
+
+    run = runs / "exp1-self-modifying"
+    metrics = json.loads((run / "metrics.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert "trajectory_mae" in metrics["train"]
+    assert "final_mae" in metrics["validation"]
+
+    output = tmp_path / "forecasts.jsonl"
+    assert load_entry("forecast")([
+        str(run), "--checkpoint", "final", "--split", "test", "--output", str(output), "--device", "cpu",
+    ]) == 0
+    assert len(output.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_self_modifying_profile_trains_with_multiple_direct_horizons(tmp_path: Path) -> None:
+    dataset, runs = tmp_path / "dataset", tmp_path / "runs"
+    write_numeric_bundle(dataset)
+    manifest_path = dataset / "manifest.yaml"
+    manifest_path.write_text(manifest_path.read_text(encoding="utf-8").replace("horizons: [1]", "horizons: [1, 2]"), encoding="utf-8")
+    assert load_entry("prepare")([str(dataset)]) == 0
+
+    assert load_entry("train")([
+        str(dataset), "--runs-dir", str(runs), "--name", "multi-horizon", "--epochs", "1", "--batch-size", "2",
+        "--device", "cpu", "--num-workers", "0",
+        "--model-profile", str(ROOT / "model-profiles" / "forecast" / "self-modifying-small.yaml"),
+    ]) == 0
+
+    config = (runs / "exp1-multi-horizon" / "config.yaml").read_text(encoding="utf-8")
+    assert "horizon_count: 2" in config
+
+
 def test_deterministic_training_requires_a_seed(tmp_path: Path) -> None:
     dataset = tmp_path / "dataset"
     write_numeric_bundle(dataset)

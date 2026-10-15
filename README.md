@@ -104,6 +104,11 @@ uv run goldfish train data/fourier --name fourier --epochs 10 --batch-size 32 \
   --model-profile model-profiles/forecast/gru-small.yaml
 uv run goldfish forecast runs/exp1-fourier --checkpoint best --split test \
   --plot runs/exp1-fourier/artifacts/forecasts/test-best.png
+
+# Recursive self-modifying forecast
+# Requires targets that are included in schema.features; supports the declared direct horizons.
+uv run goldfish train data/fourier --name fourier-self-modifying --epochs 10 --batch-size 32 \
+  --model-profile model-profiles/forecast/self-modifying-small.yaml
 ```
 
 Preparation performs:
@@ -135,6 +140,7 @@ Model architectures are selected with a required YAML profile:
 --model-profile model-profiles/forecast/lstm-small.yaml
 --model-profile model-profiles/forecast/multihead-lstm-small.yaml
 --model-profile model-profiles/forecast/deltanet-small.yaml  # DeltaNet fast-weight memory encoder
+--model-profile model-profiles/forecast/self-modifying-small.yaml  # Recursive full-parameter adaptation
 ```
 
 Profiles supply architecture-owned parameters and model registry identity. Goldfish injects data-derived dimensions (vocabulary size or numeric feature/target/horizon counts), then saves the complete resolved model configuration in the run. This keeps new model-specific hyperparameters out of the training CLI.

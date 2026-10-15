@@ -30,7 +30,7 @@ from goldfish.experiments import CHECKPOINT_FORMAT, CheckpointManager, Experimen
 from goldfish.generation import generate_text
 from goldfish.generation.text import TextTokenizer
 
-from goldfish.tasks import CausalLanguageModelTask, PointForecastTask, PrefixLanguageModelTask
+from goldfish.tasks import CausalLanguageModelTask, PointForecastTask, PrefixLanguageModelTask, SelfModifyingForecastTask
 from goldfish.training import Trainer, compile_model
 
 
@@ -523,6 +523,19 @@ def _numeric_config(args: argparse.Namespace, manifest: Mapping[str, Any], runti
     return config
 
 
+def _numeric_task(model_config: Mapping[str, Any], data_module: Any) -> Task[Any]:
+    """Select the objective required by the resolved numeric model contract."""
+    targets = cast(Sequence[str], data_module.runtime_metadata["targets"])
+    if model_config.get("name") == "self-modifying":
+        parameters = cast(Mapping[str, Any], model_config["parameters"])
+        return SelfModifyingForecastTask(
+            data_module.normalizer,
+            targets,
+            cast(Sequence[int], parameters["target_feature_indices"]),
+        )
+    return PointForecastTask(data_module.normalizer, targets)
+
+
 def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device: torch.device, dataset_lock: Mapping[str, Any]) -> int:
     validate_normalizer_lock = _future_api("goldfish.data.validation", "validate_normalizer_lock")
     data_module_class = _future_api("goldfish.data.numeric", "NumericFilesForecastDataModule")
@@ -534,7 +547,16 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
         if args.model_profile is None:
             raise ValueError("--model-profile is required for a new run.")
         profile = load_model_profile(args.model_profile)
-        model = resolve_model_config(profile, family="forecast", runtime_parameters={"feature_count": len(data_module.runtime_metadata["features"]), "target_count": len(data_module.runtime_metadata["targets"]), "horizon_count": len(data_module.runtime_metadata["horizons"])})
+        runtime_parameters: dict[str, Any] = {
+            "feature_count": len(data_module.runtime_metadata["features"]),
+            "target_count": len(data_module.runtime_metadata["targets"]),
+            "horizon_count": len(data_module.runtime_metadata["horizons"]),
+        }
+        if profile["name"] == "self-modifying":
+            features = cast(list[str], data_module.runtime_metadata["features"])
+            targets = cast(list[str], data_module.runtime_metadata["targets"])
+            runtime_parameters["target_feature_indices"] = tuple(features.index(target) for target in targets)
+        model = resolve_model_config(profile, family="forecast", runtime_parameters=runtime_parameters)
         observability_probes = profile.get("observability")
     else:
         model = {}
@@ -589,7 +611,7 @@ def _train_numeric(args: argparse.Namespace, manifest: Mapping[str, Any], device
         run.append_metrics({"epoch": result.epoch + 1, "global_step": result.global_step, "wall_time_seconds": time.monotonic() - started, "learning_rate": result.learning_rates[0], **metrics})
         checkpoints.on_epoch_end(model, optimizer, epoch=result.epoch, global_step=result.global_step, metrics=metrics, scheduler=scheduler)
 
-    trainer = Trainer(model, PointForecastTask(data_module.normalizer, data_module.runtime_metadata["targets"]), optimizer, scheduler=cast(Any, scheduler), scheduler_step_timing=resolved_training.scheduler.step_timing, scheduler_metric=getattr(resolved_training.scheduler, "monitor", None), device=device, gradient_clip_norm=cast(Mapping[str, Any], config["training"])["gradient_clip_norm"], on_epoch_end=on_epoch_end, progress=True, hooks=[probe_hook] if probe_hook is not None else [])
+    trainer = Trainer(model, _numeric_task(model_config, data_module), optimizer, scheduler=cast(Any, scheduler), scheduler_step_timing=resolved_training.scheduler.step_timing, scheduler_metric=getattr(resolved_training.scheduler, "monitor", None), device=device, gradient_clip_norm=cast(Mapping[str, Any], config["training"])["gradient_clip_norm"], on_epoch_end=on_epoch_end, progress=True, hooks=[probe_hook] if probe_hook is not None else [])
     run.start()
     try:
         resumed_epoch: int | None = None

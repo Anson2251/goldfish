@@ -175,6 +175,35 @@ For reporting, predictions and targets are inverse-transformed using the configu
 
 No masking or variable-length sequence handling is implemented for forecast targets; each batch row is a fixed-shape window.
 
+## Self-modifying point forecasting
+
+**Implementation:** `goldfish.tasks.SelfModifyingForecastTask`
+
+This task is selected automatically for the `forecast/self-modifying` model. It requires a numeric manifest where every target is also a feature.
+
+### Required output
+
+```python
+output.predictions["trajectory_forecast"]  # [B, L - 1, C]
+output.predictions["forecast"]             # [B, H, C]
+```
+
+The within-window target at position `t` is selected from the subsequent normalized input row:
+
+```python
+trajectory_targets = batch.inputs[:, 1:, target_feature_indices]  # [B, L - 1, C]
+```
+
+For mean absolute error at each trajectory position `e_t`, the task gives later predictions higher weight:
+
+```text
+trajectory_loss = mean_batch(sum(t=1..L-1, (t / (L-1)) * e_t))
+final_loss = MAE(forecast, batch.targets)  # all manifest-declared direct horizons
+loss = trajectory_loss + final_loss_weight * final_loss
+```
+
+`final_loss_weight` defaults to `1.0`. Metrics are `trajectory_mae` and `final_mae` in normalized units, plus final `mae` and `rmse` in raw target units. The final forecast tensor is used for raw metrics and standard forecast export; the interior trajectory serves only to train and inspect the adaptation path.
+
 ## Extension requirements
 
 A new task should:

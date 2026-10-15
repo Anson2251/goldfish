@@ -177,6 +177,70 @@ ModelOutput(
 
 Here `H` equals `horizon_count` and `C` equals `target_count`. `PointForecastTask` requires this forecast tensor to match the normalized batch target tensor exactly.
 
+## Recursive self-modifying forecast model
+
+**Implementation:** `RecursiveSelfModifyingForecastModel` in `goldfish.models.forecast.self_modifying`
+
+This numeric forecaster keeps its recurrent state in the complete parameter vector of a manually evaluated LSTM cell and direct forecast head. Its registered parameters are a trainable initial predictor state `theta_initial` and a fixed meta-network; at runtime every batch row receives an independent graph-connected copy of the state. The model never mutates a registered parameter during `forward`.
+
+### Constructor
+
+```python
+RecursiveSelfModifyingForecastModel(
+    feature_count: int,
+    target_count: int,
+    horizon_count: int,
+    target_feature_indices: tuple[int, ...],
+    hidden_dim: int,
+    meta_hidden_dim: int,
+    update_scale: float = 0.01,
+)
+```
+
+`horizon_count` may be any positive value. Targets must be present among input features, and `target_feature_indices` is resolved from the numeric manifest by training. `theta_t` contains `weight_ih`, `weight_hh`, `bias_ih`, `bias_hh`, plus the direct multi-horizon forecast-head weight and bias. The checked-in small profile uses `hidden_dim=16` and contains 1,459 dynamic predictor parameters for the four-feature, three-horizon Fourier dataset.
+
+### Causal parameter dynamics
+
+For each input `x_t`, the predictor first uses the old dynamic parameter state, then the fixed meta-network writes a bounded residual update:
+
+```text
+h_t, c_t = ManualLSTMCell_theta_(t-1)(x_t, h_(t-1), c_(t-1))
+x_hat = ForecastHead_theta_(t-1)(h_t)
+Delta theta_t = update_scale * tanh(meta_network(x_t, theta_(t-1)))
+theta_t = theta_(t-1) + Delta theta_t
+```
+
+The LSTM's `h_t` and `c_t` are ordinary activation state. Separately, the meta-network uses a shared per-parameter update rule: it encodes `x_t` once, combines that context with each scalar element of `theta_(t-1)`, and emits the corresponding scalar update. This keeps the fixed learning rule below the small-model budget while still updating every dynamic LSTM and forecast-head weight and bias. Consequently, the update from `x_t` affects only future predictions. The state and activation trajectories remain part of the PyTorch graph, so end-to-end loss gradients traverse every update step and optimize both the initial prior and meta-network.
+
+### Batch and output
+
+The model requires `inputs: Tensor [B, L, F]` with `L >= 2` and returns:
+
+```python
+ModelOutput(
+    predictions={
+        "trajectory_forecast": Tensor,  # [B, L - 1, C]
+        "forecast": Tensor,             # [B, 1, C]
+    },
+    representations=Tensor,               # [B, L, parameter_count]
+    diagnostics={
+        "parameter_count": float,
+        "mean_update_norm": Tensor,
+        "mean_parameter_norm": Tensor,
+        "final_parameter_shift": Tensor,
+    },
+)
+```
+
+`forecast` is the final pre-update direct multi-horizon prediction and therefore remains compatible with the normal numeric forecast export path. `trajectory_forecast` contains the horizon-one channel of preceding adjacent predictions and is consumed only by `SelfModifyingForecastTask`.
+
+Profile example:
+
+```sh
+uv run goldfish train data/fourier --name fourier-self-modifying \
+  --model-profile model-profiles/forecast/self-modifying-small.yaml
+```
+
 ## Doubly stochastic channel mixer
 
 **Implementation:** `DoublyStochasticMixer` in `goldfish.models.components.mixing`
